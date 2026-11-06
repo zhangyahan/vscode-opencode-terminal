@@ -1,0 +1,151 @@
+{
+  "name": "vscode-opencode-terminal",
+  "displayName": "OpenCode Terminal",
+  "description": "Run OpenCode in a VS Code integrated terminal and turn dropped files/selections into OpenCode mentions.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zhangyahan/vscode-opencode-terminal.git"
+  },
+  "engines": {
+    "vscode": "^1.94.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "opencode",
+    "terminal",
+    "panel",
+    "mentions",
+    "webview"
+  ],
+  "main": "./out/src/extension.js",
+  "activationEvents": [
+    "onView:opencodeTerminal.main"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "在限制模式下可以查看面板和引用，但扩展不会启动 OpenCode，也不会向终端插入内容。"
+    }
+  },
+  "contributes": {
+    "viewsContainers": {
+      "panel": [
+        {
+          "id": "opencodeTerminal",
+          "title": "OpenCode",
+          "icon": "media/opencode.svg"
+        }
+      ]
+    },
+    "views": {
+      "opencodeTerminal": [
+        {
+          "type": "webview",
+          "id": "opencodeTerminal.main",
+          "name": "OpenCode",
+          "contextualTitle": "OpenCode"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "opencodeTerminal.open",
+        "title": "OpenCode: 打开面板"
+      },
+      {
+        "command": "opencodeTerminal.start",
+        "title": "OpenCode: 启动（当前工作区）",
+        "icon": "$(play)"
+      },
+      {
+        "command": "opencodeTerminal.focusTerminal",
+        "title": "OpenCode: 显示终端",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "opencodeTerminal.addSelection",
+        "title": "OpenCode: 添加当前选区/文件为引用",
+        "icon": "$(selection)"
+      },
+      {
+        "command": "opencodeTerminal.addFile",
+        "title": "OpenCode: 添加文件为引用"
+      },
+      {
+        "command": "opencodeTerminal.pickFiles",
+        "title": "OpenCode: 从磁盘添加文件引用",
+        "icon": "$(file-add)"
+      },
+      {
+        "command": "opencodeTerminal.copyAll",
+        "title": "OpenCode: 复制全部引用",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "opencodeTerminal.clear",
+        "title": "OpenCode: 清空引用",
+        "icon": "$(clear-all)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "opencodeTerminal.start",
+          "when": "view == opencodeTerminal.main",
+          "group": "navigation@1"
+        },
+        {
+          "command": "opencodeTerminal.focusTerminal",
+          "when": "view == opencodeTerminal.main",
+          "group": "navigation@2"
+        },
+        {
+          "command": "opencodeTerminal.clear",
+          "when": "view == opencodeTerminal.main",
+          "group": "navigation@3"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "opencodeTerminal.addSelection",
+          "when": "editorTextFocus && resourceScheme == file",
+          "group": "opencode@1"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "opencodeTerminal.addFile",
+          "when": "resourceScheme == file",
+          "group": "opencode@1"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "OpenCode Terminal",
+      "properties": {
+        "opencodeTerminal.command": {
+          "type": "string",
+          "default": "opencode",
+          "scope": "machine",
+          "markdownDescription": "在 VS Code 集成终端中执行的 **shell 命令**（machine 作用域，工作区设置不能覆盖）。默认 `opencode`。禁止包含换行或控制字符；扩展不会验证该命令是否存在，也不会通过 HTTP 检查 OpenCode 版本。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run compile && node --test out/test/core.test.js out/test/runtime.test.js out/test/extension.integration.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.94.0",
+    "typescript": "^5.6.0"
+  }
+}

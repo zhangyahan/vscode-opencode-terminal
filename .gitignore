@@ -1,0 +1,11 @@
+node_modules/
+out/
+*.vsix
+*.tsbuildinfo
+.vscode-test/
+coverage/
+.env
+.env.*
+.npmrc
+*.pem
+*.key
