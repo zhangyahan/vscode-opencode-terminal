@@ -1,51 +1,70 @@
-import { randomBytes, randomUUID } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import * as vscode from 'vscode';
 
 import { formatMention, parseDropPayload, type TextRange } from './core';
 import {
-  MAX_ATTACHMENTS,
-  MAX_INSERT_TEXT_LENGTH,
+  EditorBridge,
+  type EditorBridgeLike,
+} from './editorBridge';
+import { FileDropView } from './fileDropView';
+import { spawnPty } from './ptyAdapter';
+import {
+  PtySessionManager,
+  type PtyEvent,
+  type PtySpawn,
+} from './ptySession';
+import {
+  MAX_REFERENCES,
+  planReference,
+  uniqueReferences,
+  type ReferenceFallbackReason,
+  type ReferenceTarget,
+} from './references';
+import {
+  resolveShellProfile,
+  type ShellLaunchConfig,
+  type ShellProfile,
+  type ShellProfileWarning,
+} from './shellProfile';
+import {
+  MAX_CLIPBOARD_TEXT_LENGTH,
+  MAX_PTY_INPUT_LENGTH,
   MAX_SELECTION_TEXT_LENGTH,
   SELECTION_TTL_MS,
-  appendReference,
   invalidateSelectionCache,
   matchSelection,
   parseWebviewMessage,
-  pickReferences,
   recordSelection,
-  referenceMention,
-  removeReferences,
-  restoreReferences,
-  terminalStatusText,
   validateLaunchCommand,
   type SelectionMatchReason,
   type SelectionSnapshot,
-  type StoredReference,
-  type TerminalStatusKind,
   type WebviewInboundMessage,
 } from './runtime';
-import { OpenCodeTerminals } from './terminal';
+import {
+  sanitizeEnv,
+  sanitizeProfiles,
+  terminalPlatformKey,
+  terminalSettingKeys,
+  withEditorBridgeEnvironment,
+  withTerminalEnvironment,
+} from './terminalConfig';
 
 const VIEW_ID = 'opencodeTerminal.main';
 const CONFIG_SECTION = 'opencodeTerminal';
-const STATE_REFERENCES = 'opencodeTerminal.references.v1';
 const STATE_LAST_FOLDER = 'opencodeTerminal.lastFolder.v1';
+const OUTPUT_BATCH_MS = 8;
+const MAX_OUTPUT_BATCH_CHARS = 64 * 1024;
 
 type DropMessage = Extract<WebviewInboundMessage, { readonly type: 'drop' }>;
 
-interface ViewStatus {
-  readonly kind: TerminalStatusKind;
-  readonly text: string;
-  readonly canStart: boolean;
-  readonly canInsert: boolean;
-  readonly folderName?: string;
-}
+type WorkspaceConfigChoice = 'workspace' | 'user';
 
-interface ViewAttachment {
-  readonly id: string;
-  readonly mention: string;
-  readonly folderName: string;
-  readonly outsideWorkspace: boolean;
+interface ShellRuntimeInfo {
+  readonly label: string;
+  readonly warnings: readonly string[];
 }
 
 interface Notice {
@@ -53,47 +72,79 @@ interface Notice {
   readonly message: string;
 }
 
-interface ReferenceOperation {
-  fallback?: vscode.WorkspaceFolder;
-  cancelled?: boolean;
+interface OutputBatch {
+  readonly sessionId: string;
+  readonly fromSequence: number;
+  toSequence: number;
+  data: string;
 }
 
-interface AddOutcome {
-  readonly added: boolean;
-  readonly message?: string;
+export interface ExtensionDependencies {
+  /** Injectable for tests; defaults to the prebuilt N-API node-pty adapter. */
+  readonly spawn?: PtySpawn;
+  readonly createSessionId?: () => string;
+  /** Injectable for tests; one bridge is created per started workspace PTY. */
+  readonly createEditorBridge?: () => EditorBridgeLike;
+}
+
+interface EditorBridgeEntry {
+  readonly bridge: EditorBridgeLike;
+  sessionId: string | undefined;
 }
 
 class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
   private view: vscode.WebviewView | undefined;
-  private references: readonly StoredReference[];
   private selectionCache: readonly SelectionSnapshot[] = [];
   private lastFolderKey: string | undefined;
-  private readonly closedFolders = new Set<string>();
+  private activeFolderKey: string | undefined;
+  private readonly exitedFolders = new Set<string>();
+  private readonly shellByFolder = new Map<string, ShellRuntimeInfo>();
+  private readonly workspaceConfigChoices = new Map<string, WorkspaceConfigChoice>();
   private notice: Notice | undefined;
   private autoStartAttempted = false;
+  private restartRecommended = false;
+  private lastMentionText: string | undefined;
+  private lastCols = 80;
+  private lastRows = 24;
+  private focusRequested = false;
+
+  private attached = false;
+  private streamSessionId: string | undefined;
+  private streamSequence = 0;
+  private outputBatch: OutputBatch | undefined;
+  private outputTimer: NodeJS.Timeout | undefined;
+
   private readonly disposables: vscode.Disposable[] = [];
   private viewDisposables: vscode.Disposable[] = [];
-  private readonly terminals: OpenCodeTerminals;
+  private readonly pty: PtySessionManager;
+  private readonly bridges = new Map<string, EditorBridgeEntry>();
+  private readonly createEditorBridge: () => EditorBridgeLike;
+  private disposed = false;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly extensionUri: vscode.Uri,
+    dependencies: ExtensionDependencies = {},
   ) {
-    this.references = restoreReferences(
-      context.workspaceState.get(STATE_REFERENCES),
-    );
     const savedFolder = context.workspaceState.get<string>(STATE_LAST_FOLDER);
-    this.lastFolderKey =
-      typeof savedFolder === 'string' ? savedFolder : undefined;
+    if (typeof savedFolder === 'string') {
+      this.lastFolderKey = savedFolder;
+    }
 
-    this.terminals = new OpenCodeTerminals();
-    this.disposables.push(this.terminals);
+    this.createEditorBridge =
+      dependencies.createEditorBridge ?? (() => new EditorBridge());
+    this.pty = new PtySessionManager(dependencies.spawn ?? spawnPty, {
+      ...(dependencies.createSessionId === undefined
+        ? {}
+        : { createSessionId: dependencies.createSessionId }),
+    });
+    this.disposables.push(this.pty);
     this.disposables.push(
-      this.terminals.onDidClose(({ folderKey }) => {
-        this.closedFolders.add(folderKey);
-        this.postState();
+      this.pty.subscribe((event) => {
+        this.handlePtyEvent(event);
       }),
     );
+
     this.disposables.push(
       vscode.window.onDidChangeTextEditorSelection((event) => {
         this.captureSelection(event.textEditor, event.selections);
@@ -104,21 +155,64 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
         const uri = event.document.uri.toString();
         this.selectionCache = invalidateSelectionCache(this.selectionCache, uri);
         const active = vscode.window.activeTextEditor;
-        if (
-          active !== undefined &&
-          active.document.uri.toString() === uri
-        ) {
+        if (active !== undefined && active.document.uri.toString() === uri) {
           this.captureSelection(active, active.selections);
         }
       }),
     );
     this.disposables.push(
-      vscode.workspace.onDidChangeWorkspaceFolders(() => {
-        this.postState();
+      vscode.workspace.onDidChangeWorkspaceFolders((event) => {
+        let activeRemoved = false;
+        for (const folder of event.removed) {
+          const folderKey = folder.uri.toString();
+          if (this.activeFolderKey === folderKey) {
+            activeRemoved = true;
+          }
+          this.forgetFolder(folderKey);
+        }
+        this.reconcileActiveFolder();
+
+        if (!activeRemoved) {
+          this.postState();
+          return;
+        }
+
+        // If exactly one workspace remains, show it; otherwise clear the
+        // active terminal view until the user picks a folder.
+        const folders = vscode.workspace.workspaceFolders ?? [];
+        if (this.activeFolderKey === undefined && folders.length === 1) {
+          this.activeFolderKey = folders[0].uri.toString();
+        }
+        if (this.view !== undefined) {
+          this.sendSnapshot();
+        } else {
+          this.postState();
+        }
       }),
     );
     this.disposables.push(
       vscode.workspace.onDidGrantWorkspaceTrust(() => {
+        this.postState();
+      }),
+    );
+    this.disposables.push(
+      vscode.workspace.onDidChangeConfiguration((event) => {
+        const shellChanged =
+          event.affectsConfiguration('terminal.integrated.defaultProfile') ||
+          event.affectsConfiguration('terminal.integrated.profiles') ||
+          event.affectsConfiguration('terminal.integrated.env');
+        const commandChanged = event.affectsConfiguration(
+          `${CONFIG_SECTION}.command`,
+        );
+        if (!shellChanged && !commandChanged) {
+          return;
+        }
+        if (shellChanged) {
+          this.workspaceConfigChoices.clear();
+        }
+        if (this.activeFolderKey !== undefined) {
+          this.restartRecommended = true;
+        }
         this.postState();
       }),
     );
@@ -161,6 +255,8 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
       messageListener.dispose();
       if (this.view === webviewView) {
         this.view = undefined;
+        this.attached = false;
+        this.clearOutputTimer();
       }
     });
     for (const disposable of this.viewDisposables) {
@@ -168,34 +264,63 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
     }
     this.viewDisposables = [messageListener, disposeListener];
     this.postState();
-
-    // Start once, only when there is a single unambiguous workspace. Multi-root
-    // workspaces require an explicit choice. Closing the terminal never loops
-    // back into a start.
-    if (!this.autoStartAttempted) {
-      this.autoStartAttempted = true;
-      const folders = vscode.workspace.workspaceFolders ?? [];
-      if (vscode.workspace.isTrusted && folders.length === 1) {
-        void this.start(folders[0], { auto: true });
-      }
-    }
   }
 
   dispose(): void {
+    this.disposed = true;
+    this.clearOutputTimer();
+    this.attached = false;
+    for (const folderKey of [...this.bridges.keys()]) {
+      void this.stopBridge(folderKey);
+    }
     for (const disposable of this.viewDisposables) {
       disposable.dispose();
     }
+    this.viewDisposables = [];
     for (const disposable of this.disposables) {
       disposable.dispose();
     }
+    this.disposables.length = 0;
+    this.view = undefined;
   }
 
-  async runCommand(command: 'clear' | 'copyAll'): Promise<void> {
-    if (command === 'clear') {
-      await this.confirmClear();
+  async start(): Promise<void> {
+    this.notice = undefined;
+    // An explicit start supplies its own folder choice; do not race the
+    // first-resolve auto-start with a second Quick Pick.
+    this.autoStartAttempted = true;
+    await vscode.commands.executeCommand(`${VIEW_ID}.focus`);
+    const folder = await this.requireActiveOrChooseFolder('选择要运行 OpenCode 的工作区');
+    if (folder === undefined) {
+      this.postState();
       return;
     }
-    await this.copy(this.references.map((reference) => reference.id));
+    await this.startSession(folder, { restart: false });
+  }
+
+  async restart(): Promise<void> {
+    this.notice = undefined;
+    if (!vscode.workspace.isTrusted) {
+      this.reportError('当前工作区处于限制模式，已禁止启动 PTY。');
+      return;
+    }
+    const folder = await this.requireActiveOrChooseFolder('选择要重启 OpenCode 的工作区');
+    if (folder === undefined) {
+      this.postState();
+      return;
+    }
+    await this.startSession(folder, { restart: true });
+  }
+
+  async focusTerminal(): Promise<void> {
+    this.notice = undefined;
+    await vscode.commands.executeCommand(`${VIEW_ID}.focus`);
+    if (this.view === undefined) {
+      this.focusRequested = true;
+      return;
+    }
+    this.view.show?.(true);
+    this.postMessage({ type: 'focusPty' });
   }
 
   async addActiveSelection(): Promise<void> {
@@ -210,10 +335,35 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
       return;
     }
 
+    const folder = this.activeFolderOrContaining(editor.document.uri);
+    if (folder === undefined) {
+      this.reportError('请先选择 OpenCode 工作区。');
+      return;
+    }
+    const containing = vscode.workspace.getWorkspaceFolder(editor.document.uri);
+    if (
+      containing !== undefined &&
+      this.activeFolderKey !== undefined &&
+      containing.uri.toString() !== this.activeFolderKey
+    ) {
+      this.reportError('该文件属于其他工作区，未写入当前 PTY。请先切换工作区。');
+      return;
+    }
     const range = editor.selection.isEmpty
       ? undefined
       : toTextRange(editor.selection);
-    await this.addFileUris([editor.document.uri], range);
+    const problems: string[] = [];
+    const reference = this.makeReference(
+      editor.document.uri,
+      folder,
+      range,
+      problems,
+    );
+    if (reference === undefined) {
+      this.reportError(problems[0] ?? '无法读取当前选区的引用信息。');
+      return;
+    }
+    await this.writeReferences([reference], folder);
   }
 
   async addExplorerUris(uris: readonly vscode.Uri[]): Promise<void> {
@@ -222,131 +372,80 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
       this.reportError('请从 Explorer 选择一个或多个文件。');
       return;
     }
-
-    const unique = new Map<string, vscode.Uri>();
-    for (const uri of uris) {
-      unique.set(uri.toString(), uri);
-    }
-    await this.addFileUris([...unique.values()]);
-  }
-
-  async pickFiles(): Promise<void> {
-    this.notice = undefined;
-    const uris = await vscode.window.showOpenDialog({
-      canSelectFiles: true,
-      canSelectFolders: false,
-      canSelectMany: true,
-      openLabel: '添加为引用',
-      title: '选择要添加为 OpenCode 引用的文件',
-    });
-    if (uris === undefined || uris.length === 0) {
-      return;
-    }
-    await this.addFileUris(uris);
-  }
-
-  async start(
-    folder?: vscode.WorkspaceFolder,
-    options: { readonly auto: boolean } = { auto: false },
-  ): Promise<void> {
-    this.notice = undefined;
-
-    if (!vscode.workspace.isTrusted) {
-      this.reportError(
-        '当前工作区处于限制模式（Workspace Trust 未启用），已禁止启动 OpenCode。',
-      );
-      return;
-    }
-
-    const folders = vscode.workspace.workspaceFolders ?? [];
-    if (folders.length === 0) {
-      this.reportError('未打开工作区。请先打开一个文件夹。');
-      return;
-    }
-
-    const target =
-      folder ??
-      (await this.chooseFolder('选择要运行 OpenCode 的工作区', !options.auto));
-    if (target === undefined) {
-      this.postState();
-      return;
-    }
-
-    const configured = vscode.workspace
-      .getConfiguration(CONFIG_SECTION)
-      .get<unknown>('command', 'opencode');
-    const command = validateLaunchCommand(configured);
-    if (!command.ok) {
-      this.reportError(`OpenCode 启动命令无效：${command.message}`);
-      return;
-    }
-
-    const folderKey = target.uri.toString();
-    this.lastFolderKey = folderKey;
-    this.closedFolders.delete(folderKey);
-    await this.context.workspaceState.update(STATE_LAST_FOLDER, folderKey);
-
-    let result: {
-      terminal: vscode.Terminal;
-      created: boolean;
-      restored: boolean;
-    };
-    try {
-      result = this.terminals.ensure(target, command.command);
-    } catch (error) {
-      this.reportError(`无法创建终端：${toErrorMessage(error)}`);
-      return;
-    }
-
-    this.notice = result.created
-      ? {
-          kind: 'info',
-          message:
-            `已在 ${target.name} 创建终端并执行配置的启动命令。` +
-            '扩展不会验证 CLI 是否运行，请确认 OpenCode 已就绪。',
-        }
-      : result.restored
-        ? {
-            kind: 'info',
-            message:
-              `已恢复 ${target.name} 的现有 OpenCode 终端，` +
-              '没有重复发送启动命令。扩展不会验证 CLI 是否运行。',
-          }
-        : {
-            kind: 'info',
-            message: `已复用 ${target.name} 的现有 OpenCode 终端。`,
-          };
-
-    // A manual start should reveal the terminal. Auto-start deliberately does
-    // not steal focus; otherwise opening the panel would hide the webview.
-    if (!options.auto) {
-      result.terminal.show();
-    }
-    this.postState();
-  }
-
-  async focusTerminal(): Promise<void> {
-    this.notice = undefined;
-    const folders = vscode.workspace.workspaceFolders ?? [];
-    if (folders.length === 0) {
-      this.reportError('未打开工作区。请先打开一个文件夹。');
-      return;
-    }
-
-    const folder = this.currentFolder(folders) ?? (await this.chooseFolder('选择工作区'));
+    const folder = await this.requireActiveOrChooseFolder('选择引用的工作区');
     if (folder === undefined) {
       this.postState();
       return;
     }
+    if (this.activeFolderKey === undefined) {
+      // A tree drop can activate the extension before the webview has sent
+      // ready/attach. Record the chosen folder so writeMentions can report the
+      // real "PTY 未运行" state instead of a misleading cross-workspace error.
+      this.setActiveFolder(folder);
+    }
+    await this.addUris(uris, folder);
+  }
 
-    const terminal = this.terminals.get(folder.uri.toString());
-    if (terminal === undefined) {
-      this.reportError(
-        `尚未为 ${folder.name} 创建 OpenCode 终端。请先点击“启动 OpenCode”。`,
-      );
+  /**
+   * Entry point for the native TreeView drop target. It deliberately reuses
+   * `addExplorerUris` (stat, workspace check, mention formatting, PTY write)
+   * and only adds deduplication plus focusing the existing webview. It never
+   * creates another terminal and never sends an Enter key.
+   */
+  async addDroppedUris(uris: readonly vscode.Uri[]): Promise<void> {
+    this.notice = undefined;
+    const unique = new Map<string, vscode.Uri>();
+    for (const uri of uris) {
+      const key = uri.toString();
+      if (!unique.has(key)) {
+        unique.set(key, uri);
+      }
+    }
+    if (unique.size === 0) {
+      this.reportError('未识别到可用的本地文件。请从 VS Code Explorer 拖入文件。');
       return;
     }
-    terminal.show();
+
+    await this.focusTerminal();
+    await this.addExplorerUris([...unique.values()]);
+  }
+
+  reportDropError(message: string): void {
+    this.reportError(message);
+  }
+
+  async pickFiles(): Promise<void> {
+    this.notice = undefined;
+    const folder = await this.requireActiveOrChooseFolder('选择引用的工作区');
+    if (folder === undefined) {
+      this.postState();
+      return;
+    }
+    const uris = await vscode.window.showOpenDialog({
+      canSelectFiles: true,
+      canSelectFolders: false,
+      canSelectMany: true,
+      openLabel: '插入为 @ 引用',
+      title: '选择要插入为 OpenCode 引用的文件',
+    });
+    if (uris === undefined || uris.length === 0) {
+      return;
+    }
+    await this.addUris(uris, folder);
+  }
+
+  async copyLastMentions(): Promise<void> {
+    this.notice = undefined;
+    if (this.lastMentionText === undefined || this.lastMentionText.length === 0) {
+      this.reportError('没有可复制的引用。拖入文件或使用“添加文件”命令后会保存最近一次引用。');
+      return;
+    }
+    await this.copyText(this.lastMentionText);
+  }
+
+  clearTerminal(): void {
+    this.notice = { kind: 'info', message: '已清除 xterm 滚动缓冲；没有向 PTY 发送内容。' };
+    this.postMessage({ type: 'clearTerminal' });
     this.postState();
   }
 
@@ -360,13 +459,22 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
     try {
       switch (parsed.message.type) {
         case 'ready':
-          this.postState();
+          await this.handleReady(parsed.message.cols, parsed.message.rows);
+          return;
+        case 'attach':
+          await this.handleAttach(parsed.message.cols, parsed.message.rows);
           return;
         case 'start':
           await this.start();
           return;
+        case 'restart':
+          await this.restart();
+          return;
         case 'focusTerminal':
           await this.focusTerminal();
+          return;
+        case 'chooseWorkspace':
+          await this.chooseWorkspace();
           return;
         case 'pickFiles':
           await this.pickFiles();
@@ -374,20 +482,32 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
         case 'addActiveSelection':
           await this.addActiveSelection();
           return;
+        case 'clear':
+          this.clearTerminal();
+          return;
+        case 'readClipboard':
+          await this.pasteClipboard();
+          return;
+        case 'copyClipboard':
+          await this.copyText(parsed.message.text);
+          return;
+        case 'ptyInput':
+          this.handlePtyInput(parsed.message.sessionId, parsed.message.data);
+          return;
+        case 'ptyResize':
+          this.handlePtyResize(
+            parsed.message.sessionId,
+            parsed.message.cols,
+            parsed.message.rows,
+          );
+          return;
         case 'drop':
           await this.handleDrop(parsed.message);
           return;
         case 'insert':
-          await this.insert(parsed.message.ids);
-          return;
         case 'copy':
-          await this.copy(parsed.message.ids);
-          return;
         case 'remove':
-          await this.remove(parsed.message.ids);
-          return;
-        case 'clear':
-          await this.confirmClear();
+          this.reportError('引用抽屉已移除；请直接拖放，或使用右键/“添加文件”命令插入 @ 引用。');
           return;
       }
     } catch (error) {
@@ -395,12 +515,476 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
     }
   }
 
+  private async handleReady(cols?: number, rows?: number): Promise<void> {
+    if (this.view === undefined) {
+      return;
+    }
+    if (cols !== undefined) {
+      this.lastCols = cols;
+    }
+    if (rows !== undefined) {
+      this.lastRows = rows;
+    }
+
+    if (!this.autoStartAttempted) {
+      this.autoStartAttempted = true;
+      await this.initialAutoStart(cols, rows);
+    }
+    if (this.view === undefined) {
+      return;
+    }
+    await this.handleAttach(cols, rows);
+    if (this.focusRequested) {
+      this.focusRequested = false;
+      this.postMessage({ type: 'focusPty' });
+    }
+  }
+
+  private async initialAutoStart(cols?: number, rows?: number): Promise<void> {
+    if (!vscode.workspace.isTrusted) {
+      this.postState();
+      return;
+    }
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    if (folders.length === 0) {
+      this.postState();
+      return;
+    }
+
+    let folder: vscode.WorkspaceFolder | undefined;
+    if (folders.length === 1) {
+      folder = folders[0];
+    } else {
+      folder = await this.chooseFolder('选择首次运行 OpenCode 的工作区');
+    }
+    if (folder === undefined || this.view === undefined) {
+      this.postState();
+      return;
+    }
+    await this.startSession(folder, { restart: false, cols, rows });
+  }
+
+  private async handleAttach(cols?: number, rows?: number): Promise<void> {
+    if (cols !== undefined) {
+      this.lastCols = cols;
+    }
+    if (rows !== undefined) {
+      this.lastRows = rows;
+    }
+    this.reconcileActiveFolder();
+    if (this.activeFolderKey === undefined) {
+      const folders = vscode.workspace.workspaceFolders ?? [];
+      if (folders.length === 1 && vscode.workspace.isTrusted) {
+        this.activeFolderKey = folders[0].uri.toString();
+      }
+    }
+
+    // The initial fit happens before xterm has a session, so its onResize does
+    // not reach the PTY. A ready/attach message carries the real dimensions;
+    // resize an already-running PTY even when FitAddon will not fire again.
+    const folderKey = this.activeFolderKey;
+    if (folderKey !== undefined && cols !== undefined && rows !== undefined) {
+      const snapshot = this.pty.snapshot(folderKey);
+      if (snapshot !== undefined) {
+        const resized = this.pty.resize(
+          folderKey,
+          snapshot.sessionId,
+          cols,
+          rows,
+        );
+        if (
+          !resized.ok &&
+          resized.code !== 'stale-session' &&
+          resized.code !== 'inactive'
+        ) {
+          this.reportError(`无法同步 PTY 尺寸：${resized.message}`);
+        }
+      }
+    }
+    this.sendSnapshot();
+  }
+
+  private sendSnapshot(): void {
+    const folder = this.activeFolder();
+    const folderKey = folder?.uri.toString();
+    const snapshot =
+      folderKey === undefined ? undefined : this.pty.snapshot(folderKey);
+    const shell = folderKey === undefined ? undefined : this.shellByFolder.get(folderKey);
+
+    this.attached = true;
+    this.streamSessionId = snapshot?.sessionId;
+    this.streamSequence = snapshot?.sequence ?? 0;
+    this.clearOutputTimer();
+    this.outputBatch = undefined;
+
+    this.postMessage({
+      type: 'ptySnapshot',
+      workspaceKey: folderKey ?? null,
+      folderName: folder?.name ?? null,
+      shellLabel: shell?.label ?? null,
+      session: snapshot ?? null,
+      truncated: snapshot?.truncated === true,
+      displayCols: this.lastCols,
+      displayRows: this.lastRows,
+    });
+    this.postState();
+  }
+
+  private async startSession(
+    folder: vscode.WorkspaceFolder,
+    options: {
+      readonly restart: boolean;
+      readonly cols?: number;
+      readonly rows?: number;
+    },
+  ): Promise<void> {
+    this.notice = undefined;
+    if (!vscode.workspace.isTrusted) {
+      this.reportError('当前工作区处于限制模式，已禁止启动 PTY。');
+      return;
+    }
+
+    const folderKey = folder.uri.toString();
+    this.setActiveFolder(folder);
+
+    const configured = vscode.workspace
+      .getConfiguration(CONFIG_SECTION)
+      .get<unknown>('command', 'opencode');
+    const command = validateLaunchCommand(configured);
+    if (!command.ok) {
+      this.reportError(`OpenCode 启动命令无效：${command.message}`);
+      return;
+    }
+
+    const shell = await this.resolveShell(folder);
+    if (shell === undefined) {
+      this.postState();
+      return;
+    }
+
+    if (options.restart) {
+      this.pty.stop(folderKey);
+      await this.stopBridge(folderKey);
+    }
+    if (this.disposed) {
+      return;
+    }
+
+    // Start the bridge before the shell so both editor port environment
+    // variables are present for OpenCode's first process.
+    const bridgeEntry = await this.ensureBridge(folderKey);
+    if (this.disposed) {
+      if (bridgeEntry !== undefined) {
+        await this.stopBridge(folderKey);
+      }
+      return;
+    }
+
+    const result = this.pty.ensure(folderKey, {
+      shellPath: shell.shellPath,
+      args: shell.args,
+      env: withEditorBridgeEnvironment(
+        withTerminalEnvironment(shell.env),
+        bridgeEntry?.bridge.port,
+      ),
+      cwd: folder.uri.fsPath,
+      launchCommand: command.command,
+      cols: options.cols ?? this.lastCols,
+      rows: options.rows ?? this.lastRows,
+    });
+
+    if (!result.ok) {
+      if (bridgeEntry !== undefined) {
+        await this.stopBridge(folderKey);
+      }
+      this.reportError(
+        `无法启动 PTY：${result.message}` +
+          (shell.warnings.length > 0 ? '（终端配置存在警告，详见设置）' : ''),
+      );
+      if (this.view !== undefined) {
+        this.sendSnapshot();
+      }
+      return;
+    }
+
+    if (bridgeEntry !== undefined) {
+      bridgeEntry.sessionId = result.session.sessionId;
+    }
+
+    this.exitedFolders.delete(folderKey);
+    this.restartRecommended = false;
+    if (result.created) {
+      this.shellByFolder.set(folderKey, shellInfo(shell));
+      this.notice = {
+        kind: 'info',
+        message: `已在 ${folder.name} 启动 PTY 并执行配置的启动命令（未验证 OpenCode 是否已进入前台）。`,
+      };
+    } else {
+      if (!this.shellByFolder.has(folderKey)) {
+        this.shellByFolder.set(folderKey, shellInfo(shell));
+      }
+      this.notice = {
+        kind: 'info',
+        message: `已复用 ${folder.name} 的现有 PTY；没有重复发送启动命令。`,
+      };
+    }
+
+    if (this.view !== undefined) {
+      this.sendSnapshot();
+    } else {
+      this.postState();
+    }
+  }
+
+  private async ensureBridge(
+    folderKey: string,
+  ): Promise<EditorBridgeEntry | undefined> {
+    const existing = this.bridges.get(folderKey);
+    if (existing !== undefined) {
+      try {
+        await existing.bridge.start();
+        return existing;
+      } catch {
+        await this.stopBridge(folderKey);
+      }
+    }
+
+    let bridge: EditorBridgeLike;
+    try {
+      bridge = this.createEditorBridge();
+    } catch {
+      return undefined;
+    }
+    const entry: EditorBridgeEntry = { bridge, sessionId: undefined };
+    this.bridges.set(folderKey, entry);
+    try {
+      await bridge.start();
+      return entry;
+    } catch {
+      this.bridges.delete(folderKey);
+      try {
+        await bridge.stop();
+      } catch {
+        // Startup failed; stop is best-effort.
+      }
+      return undefined;
+    }
+  }
+
+  private async stopBridge(folderKey: string): Promise<void> {
+    const entry = this.bridges.get(folderKey);
+    if (entry === undefined) {
+      return;
+    }
+    this.bridges.delete(folderKey);
+    try {
+      await entry.bridge.stop();
+    } catch {
+      // Bridge teardown is best-effort; the socket is already closed.
+    }
+  }
+
+  private async resolveShell(
+    folder: vscode.WorkspaceFolder,
+  ): Promise<ShellLaunchConfig | undefined> {
+    const platform = process.platform;
+    const platformKey = terminalPlatformKey(platform);
+    const configuration = vscode.workspace.getConfiguration(
+      'terminal.integrated',
+      folder.uri,
+    );
+
+    const workspaceKeys = terminalSettingKeys(platform).filter((key) =>
+      hasWorkspaceValue(configuration, key),
+    );
+    let choice: WorkspaceConfigChoice = 'workspace';
+    if (workspaceKeys.length > 0) {
+      const folderKey = folder.uri.toString();
+      const remembered = this.workspaceConfigChoices.get(folderKey);
+      if (remembered !== undefined) {
+        choice = remembered;
+      } else {
+        const picked = await vscode.window.showWarningMessage(
+          '当前工作区包含 terminal.integrated 的 shell、profile 或 env 设置。',
+          {
+            modal: true,
+            detail:
+              '使用工作区配置会把这些设置（包括环境变量）合并进 PTY。' +
+              '扩展不会记录或显示环境变量值。选择“仅使用用户配置”可避免工作区注入。',
+          },
+          '使用工作区配置',
+          '仅使用用户配置',
+        );
+        if (picked === undefined) {
+          return undefined;
+        }
+        choice = picked === '使用工作区配置' ? 'workspace' : 'user';
+        this.workspaceConfigChoices.set(folderKey, choice);
+      }
+    }
+
+    const read = (key: string): unknown =>
+      choice === 'user'
+        ? userScopedValue(configuration, key)
+        : configuration.get<unknown>(key);
+
+    const defaultProfileValue = read(`defaultProfile.${platformKey}`);
+    const defaultProfile =
+      typeof defaultProfileValue === 'string' && defaultProfileValue.length > 0
+        ? defaultProfileValue
+        : undefined;
+
+    const profiles = sanitizeProfiles(read(`profiles.${platformKey}`));
+    const integratedEnv = sanitizeEnv(read(`env.${platformKey}`));
+
+    // `vscode.env.shell` is VS Code's currently resolved default shell. The
+    // public API does not reveal whether a workspace profile selected it, so
+    // when the user rejects workspace terminal settings we must not use it as
+    // a fallback. Only explicit user/default profile paths may be used then.
+    const rejectedWorkspaceConfig =
+      choice === 'user' && workspaceKeys.length > 0;
+    if (rejectedWorkspaceConfig) {
+      const selectedProfile =
+        defaultProfile === undefined ? undefined : profiles[defaultProfile];
+      if (!hasExplicitProfilePath(selectedProfile)) {
+        this.reportError(
+          `已拒绝工作区终端配置，但无法仅从用户/默认设置安全确定 shell 路径。` +
+            `请在用户设置中为 terminal.integrated.profiles.${platformKey} 的默认 profile 配置显式 path，` +
+            `或重新启动并允许工作区终端配置。`,
+        );
+        return undefined;
+      }
+    }
+    const envShell = rejectedWorkspaceConfig
+      ? undefined
+      : usableEnvShell(vscode.env.shell);
+
+    const result = resolveShellProfile({
+      platform,
+      ...(defaultProfile === undefined ? {} : { defaultProfile }),
+      profiles,
+      ...(envShell === undefined ? {} : { envShell }),
+      baseEnv: process.env,
+      integratedEnv,
+      workspacePath: folder.uri.fsPath,
+      home: os.homedir(),
+      fileExists: (candidate) => {
+        try {
+          return fs.existsSync(candidate);
+        } catch {
+          return false;
+        }
+      },
+    });
+
+    if (!result.ok) {
+      const details = result.warnings
+        .slice(0, 3)
+        .map((warning) => warning.message)
+        .join(' ');
+      const workspaceHint =
+        rejectedWorkspaceConfig &&
+        (result.code === 'unsupported-profile' || result.code === 'missing-shell')
+          ? ` 已拒绝工作区终端配置，且无法仅从用户/默认设置安全确定 shell 路径。` +
+            `请在用户设置中为 terminal.integrated.profiles.${platformKey} 的默认 profile 配置显式 path，` +
+            `或重新启动并允许工作区终端配置。`
+          : '';
+      this.reportError(
+        `无法使用当前终端配置中的 shell：${result.message}` +
+          workspaceHint +
+          (details.length > 0 ? ` ${details}` : ''),
+      );
+      return undefined;
+    }
+
+    return result;
+  }
+
+  private async chooseWorkspace(): Promise<void> {
+    this.notice = undefined;
+    if (!vscode.workspace.isTrusted) {
+      this.reportError('当前工作区处于限制模式，已禁止启动 PTY。');
+      return;
+    }
+    const folder = await this.chooseFolder('切换 OpenCode 工作区');
+    if (folder === undefined) {
+      this.postState();
+      return;
+    }
+    this.setActiveFolder(folder);
+    const key = folder.uri.toString();
+    if (this.pty.snapshot(key) === undefined) {
+      await this.startSession(folder, { restart: false });
+    } else {
+      this.sendSnapshot();
+    }
+  }
+
+  private handlePtyInput(sessionId: string, data: string): void {
+    if (!vscode.workspace.isTrusted) {
+      this.reportError('当前工作区处于限制模式，已禁止向 PTY 写入。');
+      return;
+    }
+    const folderKey = this.activeFolderKey;
+    if (folderKey === undefined) {
+      this.reportError('没有活动工作区；输入未发送。');
+      return;
+    }
+    if (data.length > MAX_PTY_INPUT_LENGTH) {
+      this.reportError('输入过长，未发送到 PTY。');
+      return;
+    }
+
+    const result = this.pty.sendInput(folderKey, sessionId, data);
+    if (result.ok) {
+      return;
+    }
+    if (result.code === 'stale-session' || result.code === 'inactive') {
+      this.reportError('PTY 已不活跃；输入未发送。请先启动/重启 PTY。');
+      const snapshot = this.pty.snapshot(folderKey);
+      if (snapshot !== undefined && snapshot.sessionId !== sessionId) {
+        // A replacement session exists but the webview still has the old id.
+        this.sendSnapshot();
+      } else {
+        this.postState();
+      }
+      return;
+    }
+    this.reportError(`无法写入 PTY：${result.message}`);
+  }
+
+  private handlePtyResize(sessionId: string, cols: number, rows: number): void {
+    this.lastCols = cols;
+    this.lastRows = rows;
+    const folderKey = this.activeFolderKey;
+    if (folderKey === undefined) {
+      return;
+    }
+    const result = this.pty.resize(folderKey, sessionId, cols, rows);
+    if (!result.ok && result.code !== 'stale-session' && result.code !== 'inactive') {
+      this.reportError(`无法调整 PTY 尺寸：${result.message}`);
+    }
+  }
+
   private async handleDrop(message: DropMessage): Promise<void> {
     this.notice = undefined;
+    if (!vscode.workspace.isTrusted) {
+      this.reportError('当前工作区处于限制模式，已禁止拖放写入。');
+      return;
+    }
+
+    const folder = this.activeFolder();
+    if (folder === undefined) {
+      this.reportError('没有活动工作区。请先选择工作区并启动 PTY。');
+      return;
+    }
 
     const payload: Record<string, unknown> = {};
     if (message.uriList !== undefined) {
       payload['text/uri-list'] = message.uriList;
+    }
+    if (message.codeUriList !== undefined) {
+      payload['application/vnd.code.uri-list'] = message.codeUriList;
     }
     if (message.resourceUrls !== undefined) {
       payload.ResourceURLs = message.resourceUrls;
@@ -416,11 +1000,7 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
     }
 
     const parsed = parseDropPayload(payload);
-    const problems: string[] = [];
-    let added = 0;
-    const operation: ReferenceOperation = {};
     const plainText = parsed.plainText;
-
     if (
       parsed.files.length === 0 &&
       (plainText === undefined || plainText.length === 0)
@@ -434,49 +1014,49 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
       return;
     }
 
+    const references: ReferenceTarget[] = [];
+    const problems: string[] = [];
+    const folderKey = folder.uri.toString();
+
     for (const target of parsed.files) {
       let uri: vscode.Uri;
       try {
-        uri = vscode.Uri.parse(target.uri);
+        if (target.path !== undefined) {
+          uri = vscode.Uri.file(target.path);
+        } else if (target.uri !== undefined) {
+          uri = vscode.Uri.parse(target.uri);
+        } else {
+          problems.push('拖入的文件条目既没有路径也没有 URI。');
+          continue;
+        }
       } catch {
-        problems.push('拖入的文件 URI 无效。');
+        problems.push('拖入的文件路径或 URI 无效。');
         continue;
       }
       if (uri.scheme !== 'file') {
         problems.push(`不支持的文件类型：${uri.toString()}`);
         continue;
       }
+      const containing = vscode.workspace.getWorkspaceFolder(uri);
+      if (containing !== undefined && containing.uri.toString() !== folderKey) {
+        problems.push(`文件属于其他工作区：${uri.fsPath}`);
+        continue;
+      }
 
-      let range = target.range;
-      if (
-        range === undefined &&
-        plainText !== undefined &&
-        plainText.length > 0
-      ) {
-        const match = matchSelection(
-          this.selectionCache,
-          plainText,
-          Date.now(),
-          SELECTION_TTL_MS,
-          uri.toString(),
-        );
-        if (match.ok) {
-          range = match.entry.range;
-        } else if (match.reason === 'ambiguous') {
-          problems.push(
-            `拖入文本匹配到多个选区，未使用行号：${uri.fsPath}`,
-          );
+      try {
+        const stat = await vscode.workspace.fs.stat(uri);
+        if ((stat.type & vscode.FileType.Directory) !== 0) {
+          problems.push(`不支持文件夹：${uri.fsPath}`);
+          continue;
         }
+      } catch {
+        problems.push(`无法读取文件：${uri.fsPath}`);
+        continue;
       }
 
-      const outcome = await this.addOne(uri, range, operation);
-      if (outcome.added) {
-        added++;
-      } else if (outcome.message !== undefined) {
-        problems.push(outcome.message);
-      }
-      if (operation.cancelled === true) {
-        break;
+      const reference = this.makeReference(uri, folder, target.range, problems);
+      if (reference !== undefined) {
+        references.push(reference);
       }
     }
 
@@ -492,432 +1072,406 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
         SELECTION_TTL_MS,
       );
       if (match.ok) {
-        let uri: vscode.Uri;
+        let uri: vscode.Uri | undefined;
         try {
           uri = vscode.Uri.parse(match.entry.uri);
         } catch {
-          this.reportError('缓存的选区 URI 无效，未添加引用。');
-          return;
+          uri = undefined;
         }
-        const outcome = await this.addOne(uri, match.entry.range, operation);
-        if (outcome.added) {
-          added++;
-        } else if (outcome.message !== undefined) {
-          problems.push(outcome.message);
+        if (uri === undefined || uri.scheme !== 'file') {
+          problems.push('缓存的选区 URI 无效，未添加引用。');
+        } else {
+          const reference = this.makeReference(
+            uri,
+            folder,
+            match.entry.range,
+            problems,
+          );
+          if (reference !== undefined) {
+            references.push(reference);
+          }
         }
       } else {
         problems.push(selectionMatchMessage(match.reason));
       }
     }
 
-    if (operation.cancelled === true && added === 0) {
-      this.postState();
-      return;
-    }
-
-    const parts: string[] = [];
-    if (added > 0) {
-      parts.push(`已添加 ${added} 个引用。`);
-    }
-    if (problems.length > 0) {
-      const shown = problems.slice(0, 3).join('；');
-      parts.push(
-        `未添加 ${problems.length} 项：${shown}${problems.length > 3 ? '…' : ''}`,
-      );
-    }
-    if (parsed.warnings.length > 0) {
-      parts.push(`忽略了 ${parsed.warnings.length} 条无法识别的拖放数据。`);
-    }
-    if (parts.length === 0) {
-      this.postState();
-      return;
-    }
-
-    this.notice = {
-      kind: added > 0 && problems.length === 0 ? 'info' : 'error',
-      message:
-        parts.join(' ') +
-        (added > 0
-          ? ' 点击列表中的“插入”才会写入终端；插入不会自动按回车。'
-          : ''),
-    };
-    this.postState();
+    await this.writeReferences(
+      this.finishReferenceCollection(references, problems),
+      folder,
+      problems,
+    );
   }
 
-  private async addFileUris(
+  private async addUris(
     uris: readonly vscode.Uri[],
-    range?: TextRange,
+    folder: vscode.WorkspaceFolder,
   ): Promise<void> {
+    const references: ReferenceTarget[] = [];
     const problems: string[] = [];
-    const operation: ReferenceOperation = {};
-    let added = 0;
+    const folderKey = folder.uri.toString();
 
     for (const uri of uris) {
-      const outcome = await this.addOne(uri, range, operation);
-      if (outcome.added) {
-        added++;
-      } else if (outcome.message !== undefined) {
-        problems.push(outcome.message);
+      if (uri.scheme !== 'file') {
+        problems.push(`仅支持本地文件：${uri.toString()}`);
+        continue;
       }
-      if (operation.cancelled === true) {
-        break;
+      const containing = vscode.workspace.getWorkspaceFolder(uri);
+      if (containing !== undefined && containing.uri.toString() !== folderKey) {
+        problems.push(`文件属于其他工作区：${uri.fsPath}`);
+        continue;
+      }
+      try {
+        const stat = await vscode.workspace.fs.stat(uri);
+        if ((stat.type & vscode.FileType.Directory) !== 0) {
+          problems.push(`不支持文件夹：${uri.fsPath}`);
+          continue;
+        }
+      } catch {
+        problems.push(`无法读取文件：${uri.fsPath}`);
+        continue;
+      }
+
+      const reference = this.makeReference(uri, folder, undefined, problems);
+      if (reference !== undefined) {
+        references.push(reference);
       }
     }
 
-    if (operation.cancelled === true && added === 0) {
-      this.postState();
-      return;
-    }
-
-    if (added === 0 && problems.length === 0) {
-      this.postState();
-      return;
-    }
-
-    if (problems.length > 0) {
-      const shown = problems.slice(0, 3).join('；');
-      this.notice = {
-        kind: 'error',
-        message:
-          (added > 0 ? `已添加 ${added} 个引用。` : '') +
-          `未添加 ${problems.length} 项：${shown}${problems.length > 3 ? '…' : ''}`,
-      };
-    } else {
-      this.notice = {
-        kind: 'info',
-        message:
-          `已添加 ${added} 个引用。` +
-          '点击列表中的“插入”才会写入终端；插入不会自动按回车。',
-      };
-    }
-    this.postState();
+    await this.writeReferences(
+      this.finishReferenceCollection(references, problems),
+      folder,
+      problems,
+    );
   }
 
-  private async addOne(
+  private makeReference(
     uri: vscode.Uri,
+    folder: vscode.WorkspaceFolder,
     range: TextRange | undefined,
-    operation: ReferenceOperation,
-  ): Promise<AddOutcome> {
-    if (uri.scheme !== 'file') {
-      return { added: false, message: `仅支持本地文件：${uri.toString()}` };
-    }
-
-    let stat: vscode.FileStat;
-    try {
-      stat = await vscode.workspace.fs.stat(uri);
-    } catch {
-      return { added: false, message: `无法读取文件：${uri.fsPath}` };
-    }
-    if ((stat.type & vscode.FileType.Directory) !== 0) {
-      return { added: false, message: `不支持文件夹：${uri.fsPath}` };
-    }
-
-    const folder = await this.folderForUri(uri, operation);
-    if (folder === undefined) {
-      return operation.cancelled === true
-        ? { added: false }
-        : { added: false, message: '没有可用的工作区。' };
-    }
-
+    problems: string[],
+  ): ReferenceTarget | undefined {
     const formatted = formatMention(uri.fsPath, folder.uri.fsPath, range);
     if (!formatted.ok) {
-      return { added: false, message: formatted.message };
+      problems.push(formatted.message);
+      return undefined;
     }
-
-    const reference: StoredReference = {
-      id: randomUUID(),
+    return {
+      uri: uri.toString(),
       filePath: uri.fsPath,
       rootPath: folder.uri.fsPath,
-      folderKey: folder.uri.toString(),
-      folderName: folder.name,
       ...(range === undefined ? {} : { range }),
-      outsideWorkspace: formatted.outsideWorkspace,
-      addedAt: Date.now(),
     };
-
-    const appended = appendReference(this.references, reference);
-    if (!appended.added) {
-      switch (appended.reason) {
-        case 'duplicate':
-          return {
-            added: false,
-            message: `引用已存在：${formatted.mention}`,
-          };
-        case 'limit':
-          return {
-            added: false,
-            message: `引用数量已达上限（${MAX_ATTACHMENTS}）。`,
-          };
-        case 'invalid':
-          return { added: false, message: '引用未通过安全校验。' };
-      }
-    }
-
-    this.references = appended.references;
-    await this.persist();
-    return { added: true };
   }
 
-  private async folderForUri(
-    uri: vscode.Uri,
-    operation: ReferenceOperation,
-  ): Promise<vscode.WorkspaceFolder | undefined> {
-    const containing = vscode.workspace.getWorkspaceFolder(uri);
-    if (containing !== undefined) {
-      return containing;
+  private finishReferenceCollection(
+    references: readonly ReferenceTarget[],
+    problems: string[],
+  ): readonly ReferenceTarget[] {
+    if (references.length > MAX_REFERENCES) {
+      problems.push(`引用数量超过 ${MAX_REFERENCES} 个，超出部分已忽略。`);
     }
-
-    const folders = vscode.workspace.workspaceFolders ?? [];
-    if (folders.length === 0) {
-      return undefined;
-    }
-    if (folders.length === 1) {
-      return folders[0];
-    }
-    if (operation.fallback !== undefined) {
-      return operation.fallback;
-    }
-
-    const picked = await this.chooseFolder(
-      '该文件不在任何工作区中。选择引用相对路径要使用的工作区',
-      false,
-    );
-    if (picked === undefined) {
-      operation.cancelled = true;
-      return undefined;
-    }
-    operation.fallback = picked;
-    return picked;
-  }
-
-  private async chooseFolder(
-    placeHolder: string,
-    remember = true,
-  ): Promise<vscode.WorkspaceFolder | undefined> {
-    const folders = vscode.workspace.workspaceFolders ?? [];
-    if (folders.length === 0) {
-      return undefined;
-    }
-    if (folders.length === 1) {
-      return folders[0];
-    }
-
-    const items = folders.map((folder) => ({
-      label: folder.name,
-      description: folder.uri.fsPath,
-      folder,
-    }));
-    items.sort((a, b) => {
-      if (a.folder.uri.toString() === this.lastFolderKey) {
-        return -1;
-      }
-      if (b.folder.uri.toString() === this.lastFolderKey) {
-        return 1;
-      }
-      return a.label.localeCompare(b.label);
-    });
-
-    const picked = await vscode.window.showQuickPick(items, {
-      title: 'OpenCode 工作区',
-      placeHolder,
-      ignoreFocusOut: true,
-    });
-    if (picked === undefined) {
-      return undefined;
-    }
-    if (remember) {
-      this.lastFolderKey = picked.folder.uri.toString();
-      await this.context.workspaceState.update(
-        STATE_LAST_FOLDER,
-        this.lastFolderKey,
-      );
-    }
-    return picked.folder;
-  }
-
-  private async insert(ids: readonly string[]): Promise<void> {
-    this.notice = undefined;
-
-    if (!vscode.workspace.isTrusted) {
-      this.reportError('当前工作区处于限制模式，已禁止向终端插入引用。');
-      return;
-    }
-
-    const references = pickReferences(this.references, ids);
-    if (references.length === 0) {
-      this.reportError('没有可插入的引用。');
-      return;
-    }
-
-    const folderKeys = new Set(references.map((reference) => reference.folderKey));
-    if (folderKeys.size !== 1) {
+    const unique = uniqueReferences(references);
+    if (unique.length === 0) {
+      const shown = problems.slice(0, 3).join('；');
       this.reportError(
-        '所选引用来自不同工作区。请分别插入，避免写入错误的 OpenCode 终端。',
+        shown.length > 0
+          ? `未写入引用：${shown}${problems.length > 3 ? '…' : ''}`
+          : '未找到可写入的引用。',
       );
+    }
+    return unique;
+  }
+
+  private async writeReferences(
+    references: readonly ReferenceTarget[],
+    folder: vscode.WorkspaceFolder,
+    problems: readonly string[] = [],
+  ): Promise<void> {
+    if (!vscode.workspace.isTrusted) {
+      this.reportError('当前工作区处于限制模式，已禁止写入 PTY。');
       return;
     }
-    const folderKey = references[0].folderKey;
-    const folders = vscode.workspace.workspaceFolders ?? [];
-    const folder = folders.find((item) => item.uri.toString() === folderKey);
-    if (folder === undefined) {
-      this.reportError('引用所属的工作区已不在当前窗口中，无法插入。');
+    if (references.length === 0) {
       return;
     }
 
-    const mentions: string[] = [];
-    for (const reference of references) {
-      // Re-run the core validator immediately before anything can reach the
-      // terminal. Stored state is not trusted blindly.
-      const formatted = formatMention(
-        reference.filePath,
-        reference.rootPath,
-        reference.range,
+    const folderKey = folder.uri.toString();
+    if (folderKey !== this.activeFolderKey) {
+      this.reportError('该工作区不是当前活动 PTY。请切换工作区后再试。');
+      return;
+    }
+    const snapshot = this.pty.snapshot(folderKey);
+    if (snapshot === undefined) {
+      this.reportError(
+        'PTY 未运行，引用未写入。请先点击“重启”启动 PTY，再重新拖放/添加。',
       );
-      if (!formatted.ok) {
+      return;
+    }
+
+    const bridgeEntry = this.bridges.get(folderKey);
+    const bridgeBound =
+      bridgeEntry !== undefined &&
+      bridgeEntry.sessionId === snapshot.sessionId &&
+      this.pty.isActive(folderKey, snapshot.sessionId);
+
+    const allMentions: string[] = [];
+    const fallbackMentions: string[] = [];
+    const fallbackNotes = new Set<string>();
+    let bridgeSent = 0;
+    let unrepresentable = 0;
+
+    for (const reference of references) {
+      const plan = planReference(reference);
+      if (plan.mention !== undefined) {
+        allMentions.push(plan.mention);
+      }
+
+      if (plan.kind === 'text') {
+        if (plan.mention !== undefined) {
+          fallbackMentions.push(plan.mention);
+        } else {
+          unrepresentable += 1;
+        }
+        fallbackNotes.add(referenceFallbackNote(plan.reason));
+        continue;
+      }
+
+      if (!bridgeBound || bridgeEntry === undefined) {
+        fallbackMentions.push(plan.mention);
+        fallbackNotes.add('引用桥接未连接（需重启 PTY 采用新端口）');
+        continue;
+      }
+
+      const sent = bridgeEntry.bridge.sendMention({
+        filePath: plan.filePath,
+        lineStart: plan.lines.startLine,
+        lineEnd: plan.lines.endLine,
+      });
+      if (sent.ok) {
+        bridgeSent += 1;
+        continue;
+      }
+      // Never retry a failed/sent mention: a retry could duplicate it in the
+      // TUI. Fall back to one text mention for this reference only.
+      fallbackMentions.push(plan.mention);
+      fallbackNotes.add(
+        sent.reason === 'disconnected' || sent.reason === 'disposed'
+          ? '引用桥接已断开，已文本回退'
+          : '引用桥接尚未完成握手，已文本回退',
+      );
+    }
+
+    const uniqueFallback = [...new Set(fallbackMentions)];
+    const text = uniqueFallback.join(' ');
+    if (text.length > MAX_PTY_INPUT_LENGTH) {
+      this.reportError('引用文本过长，未写入。请分批拖入。');
+      return;
+    }
+
+    let textWritten = false;
+    if (text.length > 0) {
+      const result = this.pty.sendInput(folderKey, snapshot.sessionId, text);
+      if (!result.ok) {
+        if (result.code === 'write-failed') {
+          await this.copyText(text, '写入 PTY 失败，已复制到剪贴板。');
+          return;
+        }
+        const bridgePart =
+          bridgeSent > 0
+            ? `已发送 ${bridgeSent} 个引用添加请求（未提交）；`
+            : '';
         this.reportError(
-          `引用未通过安全校验，未插入任何内容：${formatted.message}`,
+          `${bridgePart}文本回退未写入（${result.code}）：${result.message}。` +
+            '扩展不会把引用盲目写进 shell，也不会重试已发送的桥接请求。',
         );
         return;
       }
-      mentions.push(formatted.mention);
+      textWritten = true;
     }
 
-    const text = mentions.join(' ');
-    if (text.length > MAX_INSERT_TEXT_LENGTH) {
-      this.reportError('所选引用过长，未插入。请分批插入。');
-      return;
-    }
-
-    const terminal = this.terminals.get(folderKey);
-    if (terminal === undefined) {
-      const choice = await vscode.window.showWarningMessage(
-        `尚未为 ${folder.name} 创建 OpenCode 终端。`,
-        {
-          modal: true,
-          detail: '可以先启动 OpenCode，再重新点击“插入”。本操作不会自动提交内容。',
-        },
-        '启动 OpenCode',
-        '复制到剪贴板',
+    if (bridgeSent === 0 && !textWritten) {
+      const shown = problems.slice(0, 3).join('；');
+      this.reportError(
+        shown.length > 0
+          ? `未写入引用：${shown}${problems.length > 3 ? '…' : ''}`
+          : unrepresentable > 0
+            ? '引用无法转换为可写入的格式。'
+            : '没有可写入的引用。',
       );
-      if (choice === '启动 OpenCode') {
-        await this.start(folder, { auto: false });
-        return;
-      }
-      if (choice === '复制到剪贴板') {
-        await this.copyText(text);
-        return;
-      }
-      this.postState();
       return;
     }
 
-    const preview =
-      text.length > 800 ? `${text.slice(0, 800)}…` : text;
-    const choice = await vscode.window.showWarningMessage(
-      '确认 OpenCode TUI 仍在该终端中运行？扩展无法验证 CLI 进程；若已退出，输入可能进入 shell。',
-      {
-        modal: true,
-        detail: `工作区：${folder.name}\n将插入（不会按回车）：\n${preview}`,
-      },
-      '插入到终端',
-      '复制到剪贴板',
-    );
+    this.lastMentionText =
+      allMentions.length > 0 ? [...new Set(allMentions)].join(' ') : undefined;
 
-    if (choice === '插入到终端') {
-      if (this.terminals.get(folderKey) !== terminal) {
-        this.reportError('终端在确认期间已关闭，未插入。');
-        return;
-      }
-      try {
-        // false = do not press Enter / do not auto-submit.
-        terminal.sendText(text, false);
-      } catch (error) {
-        this.reportError(`无法写入终端：${toErrorMessage(error)}`);
-        return;
-      }
-      this.notice = {
-        kind: 'info',
-        message: `已插入 ${references.length} 个引用到终端，未按回车。请确认 OpenCode TUI 后自行提交。`,
-      };
-      this.postState();
-      return;
+    const parts: string[] = [];
+    if (bridgeSent > 0) {
+      parts.push(
+        `已发送 ${bridgeSent} 个引用添加请求（未提交；内部接口无 ACK，未收到 TUI 确认）`,
+      );
     }
-
-    if (choice === '复制到剪贴板') {
-      await this.copyText(text);
-      return;
+    if (textWritten) {
+      parts.push(
+        `已将 ${uniqueFallback.length} 个引用作为文本写入 PTY（未按回车；需手动确认，未提交）`,
+      );
     }
+    if (fallbackNotes.size > 0) {
+      parts.push([...fallbackNotes].slice(0, 2).join('；'));
+    }
+    if (problems.length > 0) {
+      parts.push(`${problems.length} 项被忽略`);
+    }
+    this.notice = {
+      kind: problems.length > 0 || unrepresentable > 0 ? 'error' : 'info',
+      message: `${parts.join('；')}。`,
+    };
     this.postState();
   }
 
-  private async copy(ids: readonly string[]): Promise<void> {
-    this.notice = undefined;
-    const references = pickReferences(this.references, ids);
-    if (references.length === 0) {
-      this.reportError('没有可复制的引用。');
+  private async pasteClipboard(): Promise<void> {
+    if (!vscode.workspace.isTrusted) {
+      this.reportError('当前工作区处于限制模式，已禁止粘贴到 PTY。');
       return;
     }
-
-    const mentions: string[] = [];
-    for (const reference of references) {
-      const formatted = formatMention(
-        reference.filePath,
-        reference.rootPath,
-        reference.range,
-      );
-      if (!formatted.ok) {
-        this.reportError(`引用未通过安全校验，未复制：${formatted.message}`);
-        return;
-      }
-      mentions.push(formatted.mention);
+    let text: string;
+    try {
+      text = await vscode.env.clipboard.readText();
+    } catch (error) {
+      this.reportError(`无法读取剪贴板：${toErrorMessage(error)}`);
+      return;
     }
-    await this.copyText(mentions.join(' '));
+    if (text.length === 0) {
+      return;
+    }
+    if (text.length > MAX_CLIPBOARD_TEXT_LENGTH) {
+      this.reportError('剪贴板内容过长，未粘贴。');
+      return;
+    }
+    this.postMessage({ type: 'pasteText', text });
   }
 
-  private async copyText(text: string): Promise<void> {
+  private async copyText(
+    text: string,
+    message = '已复制到剪贴板。',
+  ): Promise<void> {
+    if (text.length > MAX_CLIPBOARD_TEXT_LENGTH) {
+      this.reportError('内容过长，未复制。');
+      return;
+    }
     try {
       await vscode.env.clipboard.writeText(text);
-      this.notice = { kind: 'info', message: '已复制到剪贴板。' };
     } catch (error) {
       this.reportError(`复制失败：${toErrorMessage(error)}`);
       return;
     }
+    this.notice = { kind: 'info', message };
     this.postState();
   }
 
-  private async remove(ids: readonly string[]): Promise<void> {
-    this.notice = undefined;
-    const next = removeReferences(this.references, ids);
-    if (next.length === this.references.length) {
-      this.notice = { kind: 'info', message: '没有找到可移除的引用。' };
-      this.postState();
+  private handlePtyEvent(event: PtyEvent): void {
+    if (event.type === 'exit') {
+      // The editor bridge belongs to this PTY session. Do not leave it
+      // listening for a shell that no longer exists.
+      void this.stopBridge(event.workspaceKey);
+    }
+    if (event.workspaceKey !== this.activeFolderKey) {
       return;
     }
-    this.references = next;
-    await this.persist();
-    this.notice = { kind: 'info', message: '已移除引用。' };
+
+    if (event.type === 'data') {
+      if (!this.attached || this.streamSessionId !== event.sessionId) {
+        return;
+      }
+      this.queueOutput(event);
+      return;
+    }
+
+    this.flushOutput();
+    if (this.streamSessionId !== event.sessionId) {
+      return;
+    }
+    this.attached = false;
+    this.streamSessionId = undefined;
+    this.exitedFolders.add(event.workspaceKey);
+    this.postMessage({
+      type: 'ptyExit',
+      sessionId: event.sessionId,
+      exitCode: event.exitCode,
+      ...(event.signal === undefined ? {} : { signal: event.signal }),
+    });
     this.postState();
   }
 
-  private async confirmClear(): Promise<void> {
-    this.notice = undefined;
-    if (this.references.length === 0) {
-      this.postState();
+  private queueOutput(event: Extract<PtyEvent, { readonly type: 'data' }>): void {
+    if (event.sequence <= this.streamSequence) {
       return;
     }
-    const choice = await vscode.window.showWarningMessage(
-      `清空全部 ${this.references.length} 个引用？`,
-      { modal: true },
-      '清空',
-    );
-    if (choice !== '清空') {
-      this.postState();
+    const current = this.outputBatch;
+    if (
+      current === undefined ||
+      current.sessionId !== event.sessionId ||
+      current.toSequence + 1 !== event.sequence ||
+      current.data.length + event.data.length > MAX_OUTPUT_BATCH_CHARS
+    ) {
+      this.flushOutput();
+      this.outputBatch = {
+        sessionId: event.sessionId,
+        fromSequence: event.sequence,
+        toSequence: event.sequence,
+        data: event.data,
+      };
+    } else {
+      current.data += event.data;
+      current.toSequence = event.sequence;
+    }
+    this.scheduleOutputFlush();
+  }
+
+  private scheduleOutputFlush(): void {
+    if (this.outputTimer !== undefined) {
       return;
     }
-    this.references = [];
-    await this.persist();
-    this.notice = { kind: 'info', message: '已清空引用。' };
-    this.postState();
+    this.outputTimer = setTimeout(() => {
+      this.outputTimer = undefined;
+      this.flushOutput();
+    }, OUTPUT_BATCH_MS);
+  }
+
+  private flushOutput(): void {
+    if (this.outputTimer !== undefined) {
+      clearTimeout(this.outputTimer);
+      this.outputTimer = undefined;
+    }
+    const batch = this.outputBatch;
+    this.outputBatch = undefined;
+    if (batch === undefined || !this.attached) {
+      return;
+    }
+    if (batch.sessionId !== this.streamSessionId) {
+      return;
+    }
+    if (batch.fromSequence !== this.streamSequence + 1) {
+      // A gap means output would be lost. Ask for a fresh snapshot instead of
+      // displaying a partial stream.
+      this.sendSnapshot();
+      return;
+    }
+    this.streamSequence = batch.toSequence;
+    this.postMessage({
+      type: 'ptyOutput',
+      sessionId: batch.sessionId,
+      fromSequence: batch.fromSequence,
+      sequence: batch.toSequence,
+      data: batch.data,
+    });
+  }
+
+  private clearOutputTimer(): void {
+    if (this.outputTimer !== undefined) {
+      clearTimeout(this.outputTimer);
+      this.outputTimer = undefined;
+    }
   }
 
   private captureSelection(
@@ -950,76 +1504,125 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
     }
   }
 
-  private currentFolder(
-    folders: readonly vscode.WorkspaceFolder[],
-  ): vscode.WorkspaceFolder | undefined {
-    if (this.lastFolderKey !== undefined) {
-      const saved = folders.find(
-        (folder) => folder.uri.toString() === this.lastFolderKey,
+  private async requireActiveOrChooseFolder(
+    placeHolder: string,
+  ): Promise<vscode.WorkspaceFolder | undefined> {
+    if (!vscode.workspace.isTrusted) {
+      this.reportError('当前工作区处于限制模式，已禁止启动 PTY 或写入。');
+      return undefined;
+    }
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    if (folders.length === 0) {
+      this.reportError('未打开工作区。请先打开一个文件夹。');
+      return undefined;
+    }
+    const active = this.activeFolder();
+    if (active !== undefined) {
+      return active;
+    }
+    return this.chooseFolder(placeHolder);
+  }
+
+  private activeFolder(): vscode.WorkspaceFolder | undefined {
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    if (this.activeFolderKey !== undefined) {
+      const found = folders.find(
+        (folder) => folder.uri.toString() === this.activeFolderKey,
       );
-      if (saved !== undefined) {
-        return saved;
+      if (found !== undefined) {
+        return found;
       }
     }
     return folders.length === 1 ? folders[0] : undefined;
   }
 
-  private computeStatus(): ViewStatus {
+  private activeFolderOrContaining(
+    uri: vscode.Uri,
+  ): vscode.WorkspaceFolder | undefined {
+    const active = this.activeFolder();
+    if (active !== undefined) {
+      return active;
+    }
+    return vscode.workspace.getWorkspaceFolder(uri);
+  }
+
+  private forgetFolder(folderKey: string): void {
+    this.pty.stop(folderKey);
+    void this.stopBridge(folderKey);
+    this.exitedFolders.delete(folderKey);
+    this.shellByFolder.delete(folderKey);
+    this.workspaceConfigChoices.delete(folderKey);
+    if (this.lastFolderKey === folderKey) {
+      this.lastFolderKey = undefined;
+    }
+    if (this.activeFolderKey === folderKey) {
+      this.activeFolderKey = undefined;
+      this.attached = false;
+      this.streamSessionId = undefined;
+      this.streamSequence = 0;
+      this.outputBatch = undefined;
+      this.clearOutputTimer();
+    }
+  }
+
+  private reconcileActiveFolder(): void {
     const folders = vscode.workspace.workspaceFolders ?? [];
-    if (!vscode.workspace.isTrusted) {
-      return {
-        kind: 'untrusted',
-        text: terminalStatusText('untrusted'),
-        canStart: false,
-        canInsert: false,
-      };
+    if (this.activeFolderKey === undefined) {
+      return;
     }
-    if (folders.length === 0) {
-      return {
-        kind: 'no-workspace',
-        text: terminalStatusText('no-workspace'),
-        canStart: false,
-        canInsert: false,
-      };
+    if (!folders.some((folder) => folder.uri.toString() === this.activeFolderKey)) {
+      this.activeFolderKey = undefined;
     }
+  }
 
-    const folder = this.currentFolder(folders);
-    const canInsert = this.references.length > 0;
-    if (folder === undefined) {
-      return {
-        kind: 'idle',
-        text: terminalStatusText('idle'),
-        canStart: true,
-        canInsert,
-      };
-    }
-
+  private setActiveFolder(folder: vscode.WorkspaceFolder): void {
     const folderKey = folder.uri.toString();
-    if (this.terminals.get(folderKey) !== undefined) {
-      return {
-        kind: 'created',
-        text: terminalStatusText('created', folder.name),
-        canStart: true,
-        canInsert,
-        folderName: folder.name,
-      };
+    this.activeFolderKey = folderKey;
+    this.lastFolderKey = folderKey;
+    this.exitedFolders.delete(folderKey);
+    void this.context.workspaceState.update(STATE_LAST_FOLDER, folderKey);
+  }
+
+  private async chooseFolder(
+    placeHolder: string,
+  ): Promise<vscode.WorkspaceFolder | undefined> {
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    if (folders.length === 0) {
+      return undefined;
     }
-    if (this.closedFolders.has(folderKey)) {
-      return {
-        kind: 'closed',
-        text: terminalStatusText('closed', folder.name),
-        canStart: true,
-        canInsert,
-        folderName: folder.name,
-      };
+    if (folders.length === 1) {
+      return folders[0];
     }
-    return {
-      kind: 'idle',
-      text: terminalStatusText('idle', folder.name),
-      canStart: true,
-      canInsert,
-      folderName: folder.name,
-    };
+
+    const items = folders.map((folder) => ({
+      label: folder.name,
+      description: folder.uri.fsPath,
+      folder,
+    }));
+    items.sort((a, b) => {
+      if (a.folder.uri.toString() === this.lastFolderKey) {
+        return -1;
+      }
+      if (b.folder.uri.toString() === this.lastFolderKey) {
+        return 1;
+      }
+      return a.label.localeCompare(b.label);
+    });
+
+    const picked = await vscode.window.showQuickPick(items, {
+      title: 'OpenCode 工作区',
+      placeHolder,
+      ignoreFocusOut: true,
+    });
+    if (picked === undefined) {
+      return undefined;
+    }
+    this.lastFolderKey = picked.folder.uri.toString();
+    await this.context.workspaceState.update(
+      STATE_LAST_FOLDER,
+      this.lastFolderKey,
+    );
+    return picked.folder;
   }
 
   private postState(): void {
@@ -1027,26 +1630,45 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
       return;
     }
 
-    const attachments: ViewAttachment[] = [];
-    for (const reference of this.references) {
-      const mention = referenceMention(reference);
-      if (mention === undefined) {
-        continue;
-      }
-      attachments.push({
-        id: reference.id,
-        mention,
-        folderName: reference.folderName,
-        outsideWorkspace: reference.outsideWorkspace,
-      });
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    const folder = this.activeFolder();
+    const folderKey = folder?.uri.toString();
+    const snapshot =
+      folderKey === undefined ? undefined : this.pty.snapshot(folderKey);
+    const shell = folderKey === undefined ? undefined : this.shellByFolder.get(folderKey);
+    const trusted = vscode.workspace.isTrusted;
+
+    let status: string;
+    if (!trusted) {
+      status = '限制模式：不会启动 PTY，也不会向终端写入。';
+    } else if (folders.length === 0) {
+      status = '未打开工作区。';
+    } else if (folder === undefined) {
+      status = '请选择工作区。';
+    } else if (snapshot !== undefined) {
+      status = `PTY 运行中（${shell?.label ?? 'shell'}）。扩展无法判断 OpenCode 是否仍在前台。`;
+    } else if (this.exitedFolders.has(folderKey ?? '')) {
+      status = 'PTY 已退出。引用不会写入 shell；请点击“重启”。';
+    } else {
+      status = 'PTY 未启动。请点击“重启”或打开侧栏自动启动。';
+    }
+    if (this.restartRecommended) {
+      status += ' 终端配置已更改，重启 PTY 后生效。';
     }
 
-    void this.view.webview.postMessage({
+    this.postMessage({
       type: 'state',
-      attachments,
-      status: this.computeStatus(),
-      notice: this.notice,
-      maxAttachments: MAX_ATTACHMENTS,
+      workspaceName: folder?.name ?? null,
+      workspaceCount: folders.length,
+      workspaceKey: folderKey ?? null,
+      shellLabel: shell?.label ?? null,
+      shellWarnings: shell?.warnings ?? [],
+      status,
+      ptyActive: snapshot !== undefined,
+      sessionId: snapshot?.sessionId ?? null,
+      trusted,
+      restartRecommended: this.restartRecommended,
+      notice: this.notice ?? null,
     });
   }
 
@@ -1058,15 +1680,26 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
     }
   }
 
-  private async persist(): Promise<void> {
-    try {
-      await this.context.workspaceState.update(
-        STATE_REFERENCES,
-        this.references,
-      );
-    } catch {
-      // Persistence is best effort; the in-memory list remains usable.
+  private postMessage(message: unknown): void {
+    if (this.view === undefined) {
+      return;
     }
+    void this.view.webview.postMessage(message);
+  }
+}
+
+function referenceFallbackNote(reason: ReferenceFallbackReason): string {
+  switch (reason) {
+    case 'whole-file-text':
+      return '整文件以纯文本 @ 引用插入（不使用行范围）';
+    case 'single-line':
+      return '单行选区只能文本回退（内部协议会丢失 end 行）';
+    case 'invalid-range':
+      return '选区范围无法结构化引用，已文本回退';
+    case 'invalid-path':
+      return '路径无法转换为引用，已忽略';
+    case 'missing-uri':
+      return '引用缺少 URI，已文本回退';
   }
 }
 
@@ -1077,12 +1710,78 @@ function selectionMatchMessage(reason: SelectionMatchReason): string {
     case 'too-long':
       return '拖入的文本过长，未尝试匹配选区。';
     case 'expired':
-      return '最近的选区缓存已过期（5 分钟）。请重新选择后拖入，或使用“添加当前选区”。';
+      return '最近的选区缓存已过期（5 分钟）。请重新选择后拖入，或使用右键“添加当前选区”。';
     case 'ambiguous':
-      return '拖入的文本匹配到多个最近选区，无法确定 URI/行号。请从编辑器直接拖入选区，或使用“添加当前选区”。';
+      return '拖入的文本匹配到多个最近选区，无法确定行号。请使用右键“添加当前选区”。';
     case 'no-match':
-      return '拖入的文本没有匹配到唯一的最近非空选区（仅做精确匹配，不猜测）。请使用“添加当前选区”或从编辑器拖入选区。';
+      return '拖入的纯文本没有匹配到唯一的最近非空选区（仅做精确匹配）。请使用右键“添加当前选区”，扩展不会把任意文本写入终端。';
   }
+}
+
+function shellInfo(config: ShellLaunchConfig): ShellRuntimeInfo {
+  const executable = path.basename(config.shellPath);
+  const label =
+    config.profileName === undefined
+      ? executable
+      : `${config.profileName} · ${executable}`;
+  return {
+    label,
+    warnings: formatWarnings(config.warnings),
+  };
+}
+
+function formatWarnings(warnings: readonly ShellProfileWarning[]): readonly string[] {
+  return warnings.slice(0, 3).map((warning) => warning.message);
+}
+
+function usableEnvShell(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    return undefined;
+  }
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(value)) {
+    return undefined;
+  }
+  return value;
+}
+
+function hasExplicitProfilePath(
+  profile: ShellProfile | undefined,
+): boolean {
+  if (profile === undefined) {
+    return false;
+  }
+  if (typeof profile.path === 'string') {
+    return profile.path.trim().length > 0;
+  }
+  return (
+    Array.isArray(profile.path) &&
+    profile.path.some((candidate) => candidate.trim().length > 0)
+  );
+}
+
+function hasWorkspaceValue(
+  configuration: vscode.WorkspaceConfiguration,
+  key: string,
+): boolean {
+  const inspected = configuration.inspect<unknown>(key);
+  return (
+    inspected !== undefined &&
+    (inspected.workspaceValue !== undefined ||
+      inspected.workspaceFolderValue !== undefined)
+  );
+}
+
+function userScopedValue(
+  configuration: vscode.WorkspaceConfiguration,
+  key: string,
+): unknown {
+  const inspected = configuration.inspect<unknown>(key);
+  if (inspected === undefined) {
+    return undefined;
+  }
+  return inspected.globalValue === undefined
+    ? inspected.defaultValue
+    : inspected.globalValue;
 }
 
 function toTextRange(range: vscode.Range): TextRange {
@@ -1113,57 +1812,43 @@ function buildWebviewHtml(
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; base-uri 'none'; form-action 'none'; img-src ${cspSource} data:; style-src ${cspSource}; script-src 'nonce-${nonce}';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; base-uri 'none'; form-action 'none'; img-src ${cspSource} data:; font-src ${cspSource}; style-src ${cspSource} 'unsafe-inline'; style-src-attr 'unsafe-inline'; script-src 'nonce-${nonce}'; worker-src 'none';">
   <link rel="stylesheet" href="${styleUri.toString()}">
   <title>OpenCode</title>
 </head>
 <body>
-  <header class="header">
-    <div class="header-text">
-      <h1>OpenCode</h1>
-      <p id="status" class="status" role="status" aria-live="polite">正在加载…</p>
-    </div>
-    <div class="header-actions">
-      <button id="start-button" class="primary" type="button">启动 OpenCode</button>
-      <button id="focus-terminal-button" type="button" hidden>显示终端</button>
-    </div>
-  </header>
-
-  <section id="notice" class="notice" role="alert" hidden></section>
-
-  <section id="drop-zone" class="drop-zone" aria-label="拖放文件或编辑器选区">
-    <p class="drop-title">拖动文件或编辑器选区到这里</p>
-    <p class="drop-hint">支持 VS Code Explorer 文件与编辑器选区。若拖放被 VS Code 拦截，请尝试按住 Shift 再拖入；仍无效请使用下方按钮或右键命令。</p>
-  </section>
-
-  <div class="toolbar">
-    <button id="add-selection-button" type="button">添加当前选区</button>
-    <button id="pick-files-button" type="button">添加文件…</button>
-    <button id="clear-button" type="button">清空</button>
+  <div id="app" class="app">
+    <header class="toolbar">
+      <button id="workspace-button" class="workspace" type="button" title="切换工作区">
+        <span id="workspace-name">工作区</span>
+      </button>
+      <span id="shell-label" class="shell" title="当前 shell">shell</span>
+      <span class="spacer"></span>
+      <button id="restart-button" type="button" title="重启 PTY">重启</button>
+    </header>
+    <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+    <main id="terminal-wrap" class="terminal-wrap">
+      <div id="terminal" class="terminal" aria-label="OpenCode 终端"></div>
+    </main>
+    <div id="drop-overlay" class="drop-overlay" hidden>拖放文件或选区以插入 @ 引用</div>
   </div>
-
-  <section class="references" aria-label="待插入引用">
-    <div class="list-header">
-      <h2>待插入引用</h2>
-      <span id="count" class="count">0 个</span>
-    </div>
-    <ul id="reference-list" class="reference-list"></ul>
-    <p id="empty-state" class="empty">暂无引用。拖入文件或选区后会显示在这里，只有点击“插入”才会写入终端。</p>
-    <div class="footer-actions">
-      <button id="insert-all-button" type="button">插入全部到终端</button>
-      <button id="copy-all-button" type="button">复制全部</button>
-    </div>
-  </section>
-
-  <footer class="footnote">插入不会自动按回车或提交；每次插入前都会弹窗确认 OpenCode TUI 仍在运行，并提供复制到剪贴板的替代方案。</footer>
-
   <script nonce="${nonce}" src="${scriptUri.toString()}"></script>
 </body>
 </html>`;
 }
 
-export function activate(context: vscode.ExtensionContext): void {
-  const provider = new OpenCodeViewProvider(context, context.extensionUri);
+let activeProvider: OpenCodeViewProvider | undefined;
+
+export function activate(
+  context: vscode.ExtensionContext,
+  dependencies: ExtensionDependencies = {},
+): void {
+  const provider = new OpenCodeViewProvider(
+    context,
+    context.extensionUri,
+    dependencies,
+  );
+  activeProvider = provider;
 
   context.subscriptions.push(provider);
   context.subscriptions.push(
@@ -1172,9 +1857,19 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
   );
 
+  const dropOutput = vscode.window.createOutputChannel('OpenCode 拖放');
+  context.subscriptions.push(dropOutput);
+  context.subscriptions.push(
+    new FileDropView({
+      addUris: (uris) => provider.addDroppedUris(uris),
+      reportError: (message) => provider.reportDropError(message),
+      log: (line) => dropOutput.appendLine(line),
+    }),
+  );
+
   context.subscriptions.push(
     vscode.commands.registerCommand('opencodeTerminal.open', () =>
-      vscode.commands.executeCommand(`${VIEW_ID}.focus`),
+      provider.focusTerminal(),
     ),
     vscode.commands.registerCommand('opencodeTerminal.start', () =>
       provider.start(),
@@ -1195,18 +1890,20 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       return provider.addExplorerUris(uris);
     }),
-    vscode.commands.registerCommand('opencodeTerminal.clear', async () => {
-      await provider.runCommand('clear');
+    vscode.commands.registerCommand('opencodeTerminal.clear', () => {
+      provider.clearTerminal();
     }),
-    vscode.commands.registerCommand('opencodeTerminal.copyAll', async () => {
-      await provider.runCommand('copyAll');
-    }),
+    vscode.commands.registerCommand('opencodeTerminal.copyAll', () =>
+      provider.copyLastMentions(),
+    ),
   );
 }
 
 export function deactivate(): void {
-  // Terminals are intentionally left alone so a user's OpenCode session is not
-  // killed when the extension host reloads.
+  // Kill every PTY this extension owns. A shell cannot survive an extension
+  // host reload because the native child process belongs to this host.
+  activeProvider?.dispose();
+  activeProvider = undefined;
 }
 
 function collectUris(value: unknown, output: vscode.Uri[]): void {

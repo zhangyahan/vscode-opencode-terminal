@@ -1,138 +1,229 @@
 # OpenCode Terminal for VS Code
 
-仓库：[zhangyahan/vscode-opencode-terminal](https://github.com/zhangyahan/vscode-opencode-terminal)。预编译 VSIX 见 [Releases](https://github.com/zhangyahan/vscode-opencode-terminal/releases)；本扩展仅通过 GitHub 分发，未发布到 VS Code Marketplace。
+在 VS Code **Secondary Sidebar（辅助侧边栏，默认位于窗口右侧）**中直接运行 **OpenCode 的真实 TUI**。同一个 `opencodeTerminalSecondary` 容器中，上方是 xterm/OpenCode webview 主区域，下方紧邻一个小型原生 **“拖入文件”** TreeView：把 Explorer 中选中的多个文件拖到该原生区域，0.0.8 会始终以纯文本 `@路径` 插入**整文件**引用；只有多行编辑器选区才通过 OpenCode 内部 editor WebSocket 结构化插入，单行选区回退为 `@路径#行-行`。所有情况都**不会按回车/Tab，也不会执行任意拖入文本**，引用需在 OpenCode 中手动确认。
 
-在 VS Code 底部面板中提供 **OpenCode** 视图，并在当前工作区打开一个原生集成终端运行 OpenCode。扩展可以把拖入的文件、编辑器选区转换成 OpenCode 的 `@文件` / `@文件#起始行-结束行` 引用，先放入待发送列表；只有用户明确点击“插入终端”时才会写入终端，且**不会自动按回车或提交**。
+仓库：[zhangyahan/vscode-opencode-terminal](https://github.com/zhangyahan/vscode-opencode-terminal)。本扩展只通过 GitHub 分发，未发布到 VS Code Marketplace。
+
+## 0.0.8 的变化
+
+- **两个视图保持原生折叠**：上方 TUI webview 与下方“拖入文件”TreeView 仍是同一 `opencodeTerminalSecondary` 容器中的两个原生视图。点击各自视图标题的折叠/展开控件，或使用 VS Code 视图标题菜单中的折叠操作即可；扩展不注入自定义折叠按钮，也不修改 90/10 初始布局和视图引用。
+- **Shift+Enter 专门换行**：仅当 `Shift+Enter` 且没有 Ctrl/Alt/Meta、也不处于 IME 组合输入时，webview 才发送 OpenCode 默认换行绑定 **Ctrl+J** 的裸 LF `\n`（不是 CR），经 xterm 唯一的 `onData` 路径写入 PTY，因此不会提交；同时阻止该 keydown 的默认行为，并对后续 keypress 只阻断、不重复发送。普通 Enter 仍由 xterm 发送 CR 提交；Ctrl+J 原有换行不变，其他修饰键组合不主动扩展。若用户在 OpenCode `cli.json` 中把换行键重新绑定到别的键，Shift+Enter 映射到 Ctrl+J 的默认假设可能不再适用；本扩展不会修改用户的 `cli.json`。
+- **IME 安全边界**：`event.isComposing`、keyCode `229` 或 key `Process` 的自定义按键处理最高优先级直接放行，中文/日文选词时按 Enter 不会被本扩展当成换行或提交吞掉。Ctrl+C/Ctrl+V 的选区复制、无选区中断和剪贴板粘贴语义保持不变。
+- **侧栏尺寸 trailing 防抖 175ms**：ResizeObserver、窗口 resize、字体/主题变化只重置计时器，用户停止拖动 175ms 后才执行一次 FitAddon 和 PTY resize（SIGWINCH），不再逐帧 rAF fit。初始 `ready` 与 snapshot attach 仍即时 fit 以保证首屏正确；容器隐藏或 `terminalWrap.clientWidth/clientHeight` 为 0 时跳过 fit，避免 FitAddon 把终端 clamp 成 2x1。防抖期间 xterm 可能按旧尺寸暂时裁切输出；这里的限制只针对 fit/PTY 尺寸通知，不承诺 TUI 输出在拖动中完全冻结。
+- 版本 `0.0.8`。升级后请 **完整 Reload Window** 让新的 webview 脚本生效。
+
+## 0.0.7 的变化
+
+- **注册到 Secondary Sidebar（辅助侧边栏）**：`viewsContainers` 只贡献 `opencodeTerminalSecondary` 的 `secondarySidebar`，不再贡献底部 Panel 的 `opencodeTerminal` 容器。默认位置由 VS Code 决定，通常是右侧；用户全局布局仍可把辅助侧边栏放到左侧，本扩展不修改全局布局。
+- 同一容器内顺序改为 **TUI 主 webview 在上、原生“拖入文件”TreeView 在下**，`initialSize` 分别为 90/10。该值只表示首次布局的 flex 权重，不是固定像素高度；原生区域的最小高度由 VS Code 决定，可拖动分隔线调整。
+- 视图 ID `opencodeTerminal.main` / `opencodeTerminal.drop`、命令 ID 与拖放写入行为保持不变；主命令文案从“打开面板”改为“打开侧栏”。
+- 升级到 0.0.7 需要 **完整 Reload Window**。扩展不写 VS Code storage 布局，也不重置全部视图；如果曾手动移动/固定过这些视图，可能需要在视图标题菜单选择 **Reset Location** 才会回到新的辅助侧边栏容器。
+- 版本要求提升到 VS Code `^1.106.0`（`secondarySidebar` contribution 自 1.106 起可用）。
+
+> 以下 0.0.7 及更早章节是历史变更记录；其中的“底部面板”“原生区域在上”等只描述当时版本。0.0.8 的当前行为以上节和“功能”章节为准。
+
+## 0.0.6 的变化
+
+- **移除顶部工具栏右侧的“文件”按钮**及其 webview DOM 绑定，避免元素不存在时的空引用。文件引用仍可通过 Explorer 右键“添加文件”、命令面板“OpenCode: 选择文件插入 @ 引用”、原生“拖入文件”TreeView 和 webview 拖放使用；重启按钮、默认底部布局以及不自动 Enter/Tab 的行为均未改变。
+
+## 0.0.5 的变化
+
+- **整文件引用改为纯文本 `@path`**。上游内部 `at_mentioned` 要求 `lineStart`/`lineEnd` 并强制显示 `#`，没有“整文件”表示；0.0.5 不再读取文件总行数、不再构造 `1..lineCount`，也不把 `0/0` 当作无范围传给上游。右键“添加文件”、命令面板“选择文件插入 @ 引用”、原生“拖入文件”TreeView 与 webview 拖放的行为一致：整文件只写 `@path`，需手动确认。
+- 多行编辑器选区仍通过 editor bridge 发送 1-based 行区间；单行选区仍文本回退 `@path#line-line`，避免 TUI 把单行范围扩展到文件尾。
+- 扩展不再为了整文件引用调用 `openTextDocument` 或读取文件内容/大小/行数；桥接协议与 OpenCode 上游均未修改。不发送自动 Enter/Tab，不提交消息。
+
+## 0.0.4 的变化
+
+- 文件/代码引用优先通过 OpenCode TUI 的内部 editor WebSocket 协议结构化插入：扩展在 `127.0.0.1` 的随机端口启动一次性桥接，并把同一端口写入 `OPENCODE_EDITOR_SSE_PORT` 与 `CLAUDE_CODE_SSE_PORT`（同时覆盖从宿主环境继承的其他编辑器端口）。TUI 完成 `initialize`（protocolVersion `2025-11-25`）与 `notifications/initialized` 握手后，扩展只发送 `at_mentioned`；TUI 侧走 `insertFileMention`，**不会自动按 Enter/Tab**。
+- 结构化引用保留源 URI 与零基选区，不把 `@...` 字符串反解析成 URI。多行选区使用既有 core 的 1-based 闭区间转换（`end.character === 0` 会排除结束行）；整文件使用 `1..document.lineCount`（单行文件为 `1..1`，与 TUI 的整文件语义一致）。
+- **单行选区明确回退为文本 `@path#line-line`**：上游 TUI 在 `lineStart === lineEnd` 时会丢弃 `end`，导致范围扩展到文件尾；本扩展不会扩大范围伪装成功。桥接未连接/断开/启动失败时同样只做一次文本回退，并提示“需手动确认”，不延时按键、不重试已发送的 mention。
+- 整文件结构化引用受大小/行数/疑似二进制限制（5 MB、200,000 行）；超限或无法读取 `lineCount` 时回退文本。
+- 桥接是内部接口，没有 ACK：扩展最多只能提示“已发送引用添加请求（未提交）”，无法证明 TUI 已插入。升级后需要**重启 PTY**，让新的 OpenCode 进程读取新的端口环境变量。
+- 0.0.3 的原生“拖入文件”TreeView、拖放解析、shell/profile/env 处理与键盘输入行为保持不变。
+
+## 0.0.3 的变化
+
+- 同一 `viewsContainers.panel` / `opencodeTerminal` 容器内新增原生 TreeView：`opencodeTerminal.drop`（标题“拖入文件”），作为稳定的文件拖放目标；下方仍是原来的 xterm webview TUI。
+- `onView:opencodeTerminal.drop` 会在用户首次把文件拖到该区域时自动激活扩展，并聚焦现有 OpenCode webview；不会创建第二个终端。
+- 原生拖放支持多文件、去重、`text/uri-list`、`application/vnd.code.uri-list`、`files`/`DataTransferItem.asFile()?.uri` 与 `CodeFiles`。目录、非 `file:` URI、相对路径、控制字符及危险 scheme 仍由现有 host `stat`/`formatMention` 校验拒绝。
+- 修正 `CodeFiles` 的真实格式：VS Code 传的是原生绝对路径数组（如 `C:\Work\a.ts`、UNC、`/work/a.ts`），不是 `file:` URI；0.0.3 仅对 `CodeFiles` 信任绝对路径，并保留原有 `file:` URI 兼容。`text/plain` 永远不会被猜成文件路径。
+- webview 的拖放监听改为 `document` capture，覆盖工具栏和 notice；`application/vnd.code.uri-list` 与 `text/uri-list` 会同时送到 host 合并，不再只保留第一个字段。webview 内的 Explorer 拖放仍受 VS Code 平台限制，不保证可用；请优先使用原生“拖入文件”区域。
+
+## 0.0.2 的变化
+
+- 侧栏主区域是一个占满高度的 xterm 终端，直接显示 shell / OpenCode TUI 的 ANSI 输出。
+- 顶部只有一条很小的工具栏：工作区、当前 shell 状态、重启 PTY、插入文件。
+- 删除了旧的大引用列表、插入全部、每次插入前的模态确认框和附件抽屉。
+- 从 Explorer/编辑器拖放后，引用立即写入活动 PTY；引用之间使用空格分隔。
+- 拖放的事件在 xterm 容器上以 capture 阶段拦截 `drop`，阻止默认导航/文件打开行为。
+- 旧的 command ID 全部保留，但 `opencodeTerminal.focusTerminal` 现在聚焦嵌入式 xterm，不再调用原生 `createTerminal`。
 
 ## 功能
 
-- 底部面板（`viewsContainers.panel`）注册 OpenCode webview 视图，与 Terminal、Problems 等面板位于同一区域。
-- 使用原生 `vscode.window.createTerminal` 创建终端，`cwd` 为选中的工作区目录，位置为 Panel。
-- 终端按工作区复用：同一个工作区不会重复启动 OpenCode；多个工作区（multi-root）会弹出选择。
-- 支持从 VS Code Explorer 拖入文件、从编辑器拖入选区，也提供命令和按钮：
-  - `OpenCode: 添加当前选区/文件为引用`
-  - `OpenCode: 添加文件为引用`（Explorer 右键，多选可用）
-  - `OpenCode: 从磁盘添加文件引用`（打开系统文件选择框）
-  - 视图内按钮：启动、添加当前选区、添加文件、插入、复制、移除、清空、显示终端
-- 拖入的引用先显示在列表中，不会直接进入终端。
-- 插入前弹出模态确认，提示先确认 OpenCode TUI 仍在终端中运行；如果终端已退出，输入可能进入 shell。可选择“复制到剪贴板”作为安全替代。
-- 引用保存在扩展的 workspace state 中，切换视图或暂时隐藏面板不会丢失；终端关闭后引用仍保留。
-- 所有发送内容在插入前再次通过 `src/core.ts` 的 `formatMention` 校验，拒绝控制字符、带空格的路径、带 `#` 的歧义路径。
+- Secondary Sidebar（`viewsContainers.secondarySidebar`）注册 OpenCode 容器 `opencodeTerminalSecondary`：上方是 OpenCode webview/xterm TUI，下方是原生“拖入文件”TreeView；两个视图都可使用 VS Code 原生折叠操作收起/展开，扩展不注入折叠按钮。
+- 每个工作区拥有独立的 PTY 会话；单根工作区首次打开侧栏自动启动，多根工作区用 Quick Pick 选择。
+- xterm 使用 FitAddon + ResizeObserver 适应侧栏尺寸：尺寸/字体/主题变化采用 175ms trailing 防抖，停止变化后只 fit 一次；初始 ready 和 snapshot 恢复仍即时 fit，隐藏或零尺寸时不 fit。手动键盘输入原样送入 PTY（Ctrl+C、ESC、方向键等控制键不做过滤），仅 `Shift+Enter` 映射为 Ctrl+J 的 LF 换行。
+- 拖放/引用：
+  - 整文件引用：始终写纯文本 `@src/core.ts`（不构造行范围、不读取总行数），需手动确认。
+  - 多行编辑器选区：结构化桥接时发送 1-based 行区间；否则文本回退 `@src/core.ts#12-20`。
+  - 单行选区：始终文本回退 `@src/core.ts#12-12`，避免 TUI 把单行范围扩展到文件尾；提示需手动确认。
+  - 纯文本只有在 5 分钟选区缓存中**精确且唯一**匹配时才生成行号；无匹配时提示使用右键“添加当前选区”，不会把任意文本执行到终端。
+- 支持 Ctrl+C 复制 xterm 选区（有选区时不向 PTY 发送 Ctrl+C；无选区时 Ctrl+C 仍作为终端中断发送），Ctrl+V 通过扩展读取剪贴板后交给 xterm 粘贴。
+- 支持 Shift+Enter 换行：映射为 OpenCode 默认 Ctrl+J 的裸 LF，不发送 CR、不提交；普通 Enter 仍提交。IME 组合输入期间（`isComposing`/keyCode 229/key `Process`）本扩展的按键处理全部放行，不会吞掉选词回车。
+- 有限输出缓冲（约 200 KB）。超过时 webview 会提示较早的输出已截断；这是屏幕恢复缓冲，不是无损日志。
 
 ## 环境要求
 
-- VS Code `^1.94.0`。
-- 本地已安装 OpenCode CLI，并能在 VS Code 集成终端所在环境中执行 `opencode`。
-  - 请参考 OpenCode 官方文档安装；安装后可用 `opencode --version` 确认。
-  - 本扩展按 OpenCode V2 的行为设计：默认执行 `opencode` 即启动 TUI，不假设存在 `--port`、`/tui/append-prompt` 等 V1 内部接口，也不进行 HTTP 探测。
-- 工作区必须处于 **Workspace Trust** 状态。限制模式（untrusted）下扩展会显示面板，但禁止启动 OpenCode 和插入内容。
+- VS Code `^1.106.0`（`secondarySidebar` contribution 的最低版本）。
+- **Windows x64**：0.0.8 的已构建 VSIX 只声明并验证了 `win32-x64`。其他平台的理论依赖已由上游提供，但本版本没有验证，也不会声称支持。
+- 本地已安装 OpenCode CLI，并且在 VS Code 默认终端环境中能执行 `opencode`。
+- 工作区必须处于 **Workspace Trust**。限制模式下扩展不会 spawn PTY、读取剪贴板或向终端写入任何内容。
 
-## 安装与运行
-
-### 从源码 F5 调试
+## 安装
 
 ```powershell
-npm install
-npm run compile
+code --install-extension vscode-opencode-terminal-0.0.8-win32-x64.vsix
 ```
 
-在 VS Code 中打开本目录，按 **F5**（Run Extension），会启动一个扩展开发宿主窗口。打开一个文件夹后，点击底部面板的 **OpenCode** 图标。
+安装或升级后请 **完整 Reload Window**。0.0.8 不再贡献旧 `viewsContainers.panel` 容器；如果曾手动移动/固定过 OpenCode 视图，可能需要在视图标题菜单选择 **Reset Location**。扩展不会写入 VS Code storage 布局，也不会重置全部视图。
 
-### 安装 VSIX
+VSIX 内含 `@lydell/node-pty` 的 N-API 预编译产物，以及桥接使用的锁定版本 `ws` 运行依赖；安装扩展不需要 Visual Studio Build Tools、node-gyp 或全局编译器。
 
-```powershell
-npx @vscode/vsce package --allow-missing-repository
-code --install-extension vscode-opencode-terminal-0.0.1.vsix
-```
+## 使用
 
-VSIX 文件名以实际打包结果为准。
+### 启动与重启
 
-## 使用说明
+- 单根工作区：首次打开侧栏时自动启动一次 PTY，并执行 `opencodeTerminal.command`（默认 `opencode`）。
+- 多根工作区：首次打开侧栏会弹出工作区选择；之后可在顶部工作区按钮切换。
+- 顶部“重启”会杀掉当前工作区的 PTY 并重新启动；不会恢复上一个终端里的进程。
+- 侧栏隐藏/切走时会保留 PTY 和 xterm 上下文。关闭侧栏视图不会立刻杀掉 PTY，重新打开会通过 snapshot 恢复；扩展 dispose/deactivate 或窗口重载会杀掉本扩展创建的 PTY，无法恢复会话。
+- 从多根工作区移除某个文件夹时，扩展会立即 kill 对应 PTY、清理 backlog/活动状态；如果移除的是当前活动工作区，会清空 xterm 或切换到唯一剩余工作区。
 
-### 启动
+### Shell 配置
 
-- 单根工作区：首次打开 OpenCode 面板时会自动启动一次终端并执行配置的启动命令。扩展不会因为面板显示/隐藏或终端关闭而循环重启。
-- 多根工作区：点击“启动 OpenCode”，在 Quick Pick 中选择工作区。每个工作区维护独立终端。
-- 通过面板按钮或命令启动时会显示原生终端；自动启动不抢焦点，以免把 webview 面板切走。
-- 扩展重载后会通过终端 env 标识恢复本扩展创建、同一工作区且仍存活的终端，不会给已有终端重复发送启动命令。
-- 状态文案会写“终端已创建，请确认 OpenCode 已就绪”，**不会声称已经验证 CLI 正在运行**。扩展无法可靠判断 TUI 是否还在前台。
+扩展通过公开 API 读取当前工作区作用域下的：
 
-### 添加文件和选区
+- `terminal.integrated.defaultProfile.<platform>`
+- `terminal.integrated.profiles.<platform>`
+- `terminal.integrated.env.<platform>`
 
-- 从 Explorer 拖动一个或多个文件到 OpenCode 面板。
-- 从编辑器拖动选区到 OpenCode 面板。
-- 使用编辑器右键菜单、Explorer 右键菜单或视图按钮添加。
-- 若拖放被 VS Code 拦截，请尝试按住 **Shift** 再拖入；仍无效请使用面板按钮或编辑器/Explorer 右键命令。
-- 文件引用会变成 `@相对路径`；如果文件在工作区外，则保留绝对路径（`/` 分隔）。
-- 选区引用会变成 `@路径#起始行-结束行`（OpenCode 使用 1-based 行号）。
-- 路径包含空格时拒绝添加，并明确报错。扩展不会自创 OpenCode 的引号/转义语法。
-- 路径包含 `#` 时同样拒绝，因为会与行号后缀产生歧义。
+在没有工作区 shell 配置冲突时，用 `vscode.env.shell` 作为 VS Code 已检测到的默认 shell 路径 fallback。支持 profile 的 `path`、`args`、`env`、`${env:...}`、`${userHome}`、`${workspaceFolder}` 等变量；Windows 上参数可以是单个 CommandLine 字符串，POSIX 上要求参数数组（不会猜测引号拆分规则）。
 
-### 选区缓存与拖入文本
+安全约束：
 
-编辑器的非空选区会进入一个 **5 分钟**的短期缓存（最多 100 条）。当拖放 payload 只有纯文本、没有携带 URI/range 时：
+- PTY 的 `cwd` 始终是选中的工作区 `folder.fsPath`。
+- 合并环境变量时会清理 `ELECTRON_RUN_AS_NODE` 等 Electron 宿主变量，并设置 `TERM=xterm-256color`、`COLORTERM=truecolor`。
+- 如果工作区设置包含 `terminal.integrated.profiles/env/defaultProfile`，首次启动会明确弹窗询问：使用工作区配置，或仅使用用户/默认配置。选择结果只缓存在当前扩展会话；相关设置变化后会重新询问。
+- 选择“仅使用用户配置”后，扩展**不会**使用 `vscode.env.shell` fallback：公开 API 无法判断该路径是否已被工作区 profile/defaultProfile 改写，因此只允许 user/default profile 的显式 `path`。如果用户默认 profile 只有 `source` 而没有 `path`，扩展会明确报错并要求在用户设置中补充 `terminal.integrated.profiles.<platform>` 的 `path`，不会猜测旧版 PowerShell 路径，也不会静默使用工作区路径。
+- 扩展不会把环境变量值写入日志或 webview。
+- 无法解析所选 profile 时会显示明确错误，不会偷偷换成另一个 shell。Windows Terminal 只是 VS Code 的宿主终端，不需要也不内嵌 `wt.exe`。
+- 默认 shell/profile/env 设置变化后，状态中会提示“重启 PTY 后生效”；扩展不会自动杀掉正在运行的 TUI。
 
-1. 只有拖入文本与缓存中的文本**完全一致**；
-2. 并且只匹配到唯一的 URI + range；
+### 拖放与引用
 
-才会生成代码选区引用。过期、无匹配或匹配到多个选区时不会猜测、不会把拖入的纯文本直接发送到终端，而是提示使用“添加当前选区”或重新拖入。文档内容发生变化时会立即清除该文档的全部选区缓存，再按当前有效选区重新采样，避免使用过期行号。
-
-如果拖放数据本身带有文件 URI 和 range（例如 `CodeEditors`），则直接使用该 range。文件 URI 没有 range 且同时有纯文本时，会尝试在该文件对应的缓存中做唯一匹配。
-
-### 插入到终端
-
-- 点击列表中的“插入终端”或“插入全部到终端”。
-- 每次插入都会弹出模态确认，提醒确认 OpenCode TUI 仍在该终端中运行。
-- 确认后使用 `terminal.sendText(text, false)`：只输入引用，**不按回车、不自动提交**。
-- 如果用户选择“复制到剪贴板”，则只复制引用文本，不写终端。
-- 如果终端已经关闭，会提示先启动，或提供复制到剪贴板。
-- 引用来自不同工作区时会拒绝一次性插入，避免写错终端。
+- **推荐入口**：TUI 下方紧邻一个原生“拖入文件”区域（TreeView）。从 **VS Code Explorer** 多选文件后拖到该区域即可；拖到根空白或提示项都支持，扩展会去重并只写入一次引用。
+- 原生区域是唯一的稳定 Explorer 拖放入口。VS Code 1.145.2 中，Explorer 内部拖拽到 webview/xterm 区域可能被平台 iframe 的 pointer-events 边界拦截；扩展不会调用私有 DOM API，也不会强行修改 iframe pointer-events 来宣称“webview 一定能接收”。
+- webview 仍保留 `document` capture 的拖放监听，能收到的事件会照常处理（工具栏、notice 和 xterm 区域都覆盖）。从编辑器拖入选区时，如果 payload 只有纯文本，会按“完整文本 + 唯一 URI/range”在 5 分钟缓存中匹配。
+- 有明确文件来源时（Explorer/CodeFiles/text/uri-list），不会再把 Explorer 的路径 label 当成编辑器文本去匹配行号；只有完全没有文件、仅有纯文本的拖放才会走选区匹配。
+- 系统文件管理器（Windows Explorer/Finder 等）拖入的 `files` 只有在 `DataTransferItem.asFile()?.uri` 存在时才接受；没有路径时绝不根据文件名猜路径，会提示改用原生区域或命令面板的“选择文件插入 @ 引用”。
+- 文档内容变化会立即清除该文档的选区缓存，避免使用过期行号。
+- 所有路径引用都经过 `src/core.ts` 的 `formatMention`：
+  - 工作区内使用相对路径；
+  - 工作区外保留绝对路径；
+  - 拒绝控制字符、空格路径和带 `#` 的歧义路径。
+- `CodeFiles` 按 VS Code 的真实负载解析为原生绝对路径（Windows `C:\...`、UNC、POSIX `/...`），host 使用 `vscode.Uri.file(path)`；仍兼容旧的 `file:` URI 条目，且 URI 字符串不会被提前 decode。
+- 写入前会确认 PTY 仍活跃、bridge 绑定的 sessionId 与当前 PTY 一致；未启动时只提示先启动/重启，**不会盲目把引用写进 shell**，也不会创建另一个终端。
+- 多行选区的结构化桥接只发送 `at_mentioned` JSON-RPC 通知，不向 PTY 写 `@...`；整文件与单行选区始终调用 `sendInput(text)` 写入纯文本引用，文本不含 CR/LF/Tab，不附加 `\r`，并提示需手动确认。是否提交由用户自己决定。
+- 拖入的任意纯文本不会直接写入 PTY，也不会被当作 shell 命令执行。
+- 两个视图的默认顺序是 TUI 在上、原生“拖入文件”在下。`initialSize` 90/10 只表示首次布局的 flex 权重，不是固定 40px 或不可改高度；TreeView 的最小高度由 VS Code 决定。如果区域太大或太小，拖动两个视图之间的分隔线调整即可。
 
 ## 安全设计
 
-- 启动命令配置 `opencodeTerminal.command` 为 **machine 作用域**，工作区设置无法覆盖；默认值 `opencode`。
-- 该配置明确是 **用户可信的 shell 命令**（不是可执行文件路径 + 参数，也不是沙箱）。扩展不解析、不转义命令内容；安全相关校验仅拒绝控制字符（含换行），另有空命令和长度上限。单行命令本身仍可包含 `&&`、管道等 shell 语法。由于设置是 machine 作用域，工作区设置不能覆盖它。
-- 未启用 Workspace Trust 时禁止启动和插入。
-- Webview 使用 CSP nonce，只加载 `media/` 下的外部 JS/CSS；不使用内联脚本。
-- Webview 通过 `textContent` 构建 DOM，不把消息内容当 HTML。
-- 扩展对 webview 消息做类型、字段、长度和 ID 白名单校验；插入/复制/移除只传引用 ID，不传任意待发送文本。
-- 拖放 payload 的纯文本只用于选区匹配，不会直接进入终端；所有插入的 mention 都会再次通过 `formatMention` 校验。
-- 拖放 JSON 字段和单条消息都有长度上限。
-- 不实现任何猜测的 HTTP/API 调用，也不依赖 OpenCode V1 的内部接口。
+- Workspace Trust 未启用时绝不 spawn PTY、读取剪贴板或写入。
+- Webview CSP：`default-src 'none'`，脚本只允许 nonce 外部文件，不使用 CDN；xterm 需要内联 style，因此仅对 `style-src`/`style-src-attr` 显式开放 `'unsafe-inline'`，没有放开脚本内联。
+- 所有 webview 消息都做类型、长度、会话 ID、尺寸边界校验；PTY 写入同时校验工作区 key 和 sessionId，跨工作区/过期会话不能写入。
+- 输出使用带 sequence 的 snapshot + 增量 batch 协议；webview 按 sequence 去重，发现缺口会重新请求 snapshot，避免静默丢输出。
+- 拖放 MIME 字段和单条消息有大小上限；引用最终文本再次经过 core 校验。
+- editor bridge 只监听 loopback（`127.0.0.1`），拒绝带 `Origin` 的浏览器式连接和非 loopback 来源；单连接替换式重连，`maxPayload` 64 KB，握手超时 5 秒。初始化响应只含 `capabilities: {}` 与固定 `serverInfo`，不读取或回传环境变量。
+- 桥接没有未完成握手的持久队列：TUI 未发 `notifications/initialized` 前 `sendMention` 直接失败并回退文本，不会把引用转交给之后的新连接。PTY 退出、重启、移除工作区、扩展 dispose 都会关闭 socket/server/定时器。
+- 不调用 OpenCode HTTP/API，也不读取 `cli.json`、不写 `claude.ide` 锁文件；只使用上游 TUI 已实现的 editor WebSocket 协议。
 
 ## 已知限制
 
-1. **VS Code 原生终端不能嵌入 webview。** 因此 OpenCode 视图和 OpenCode 终端是面板中的两个标签页；扩展不会伪造一个终端控件。
-2. 扩展无法验证 OpenCode CLI 是否仍在运行。状态只表示“终端已创建/已复用/已关闭”。
-3. 启动命令是单行 shell 命令，不支持多行脚本；单行内仍可包含 `&&`、管道等 shell 语法。扩展不会解析或自动转义任意 shell 命令，也不会提供沙箱隔离。
-4. 路径中含空格或 `#` 的文件不会被添加为引用；这是有意的安全/歧义限制。
-5. 纯文本拖放只有在 5 分钟缓存中存在唯一精确匹配的选区时才生成行号；不保证所有编辑器拖放源都会提供可识别的 MIME 数据。
-6. 多根工作区中，工作区外的文件添加引用时需要选择使用哪个工作区来计算相对路径。
-7. 当前只接受本地 `file:` URI；Remote/WSL 等虚拟文件系统 URI 不会被添加为引用。命令在 VS Code 集成终端环境中执行，远程场景还需要该环境中可执行 `opencode`。
-8. 未进行 Marketplace 发布配置；`publisher` 是本地占位值。
+1. **VS Code 没有公开 API 可以把原生集成终端嵌入 webview。** 本扩展自己用 node-pty 启动 shell；它不是复刻 VS Code 终端进程，因此不会有 VS Code 终端标签页里的任务/变量解析等全部能力。
+2. **扩展无法判断 OpenCode 是否仍在前台。** PTY 里如果 OpenCode 已退出，用户随后直接敲键盘仍会进入 shell。拖放写入只检查 PTY 是否活跃，无法检查当前前台程序；这是终端协议本身的限制。
+3. **窗口重载/扩展重载会结束 PTY。** 原生子进程属于扩展宿主，deactivate 时会主动 kill，避免孤儿进程；会话无法跨重载恢复。
+4. 路径含空格或 `#` 的文件不会被添加为引用；这是有意的安全/歧义限制。
+5. 只接受本地 `file:` URI；Remote/WSL/虚拟文件系统不在此版本的验证范围。
+6. 纯文本拖放只在缓存存在唯一精确匹配时生成行号；原生“拖入文件”区域只处理文件/URI，不把文件名或纯文本猜成路径。
+7. `vscode.env.shell` 只能返回“最终解析后的路径”，公开 API 无法说明它是否来自工作区 profile/defaultProfile。因此在用户拒绝工作区终端配置时，扩展不会使用它；用户默认 profile 若依赖 VS Code 自动检测（只有 `source` 没有 `path`），需要改为显式 `path`。
+8. 系统文件管理器拖入的文件只有在公开 API 暴露 `DataTransferItem.asFile()?.uri` 时才能使用；没有路径时只提示，不猜测。Explorer 内部拖到 webview 区域仍可能被平台 iframe 拦截，原生“拖入文件”区域是稳定入口。
+9. 已构建 VSIX 只针对 `win32-x64`，不声称支持 macOS/Linux。
+10. `initialSize` 90/10 只影响首次布局权重，不是固定高度；VS Code 可能按容器可用空间和 TreeView 最小高度调整，用户可拖动分隔线。
+11. `publisher` 是本地占位值，未做 Marketplace 发布配置。
+12. editor WebSocket 是 OpenCode TUI 的内部接口（`packages/tui/src/context/editor.ts`），不是公开稳定 API；协议版本或 `clientInfo.name` 变化时扩展会拒绝握手并回退文本。只有 TUI 明确支持 `initialize` / `notifications/initialized` / `at_mentioned` 时才可能结构化插入。
+13. 桥接没有 ACK/确认帧；“已发送引用添加请求（未提交）”只表示帧已写入 socket，不表示 OpenCode 已完成插入。
+14. 整文件引用始终是纯文本 `@path`；多行选区在桥接未连接/握手未完成时也只能文本回退；单行选区固定文本回退。所有文本仍需用户在 OpenCode 中手动确认。
+15. 已经运行的旧 OpenCode 进程不会自动获得新端口；升级后必须重启 PTY（顶部“重启”）才会尝试使用结构化桥接。
+16. 辅助侧边栏默认在右侧，但这是 VS Code 的全局布局设置；本扩展不强制或修改它。若曾把视图手动移动到其他位置，升级后可能需要 Reset Location。
+
+## 版本与平台
+
+- 版本：`0.0.8`
+- 目标平台：`win32-x64`
+- VSIX：`vscode-opencode-terminal-0.0.8-win32-x64.vsix`
 
 ## 开发与测试
 
 ```powershell
-npm run check    # 类型检查
-npm run compile  # 编译到 out/
-npm test         # 编译并运行 core + runtime + mock VS Code 集成测试
+npm install
+npm run check        # 扩展 + webview TypeScript 类型检查
+npm run build        # check + 编译扩展 + esbuild 打包 xterm
+npm test             # 编译并运行全部非 native Node 测试（不使用 --force-exit）
+npm run test:native  # 单独运行 node-pty N-API smoke（该文件需要 --test-force-exit）
+npm run smoke:native # test:native 的别名
+npm run package      # 生成 win32-x64 VSIX
 ```
 
-测试不依赖真实 VS Code 或真实 OpenCode：核心格式化、拖放解析、webview 消息校验、选区缓存匹配、终端复用/关闭逻辑由纯函数或纯类覆盖；`test/extension.integration.test.ts` 使用 mock `vscode` 覆盖激活命令注册、panel CSP、终端 cwd/nativePanel、启动一次、复用、关闭重建和扩展重载后的终端恢复。
+测试覆盖：
+
+- `core` / `runtime`：mention/range 格式化、拖放解析（含真实 Windows/POSIX/UNC `CodeFiles` 路径、URI 兼容、多字段合并去重）、webview 协议、选区缓存、命令校验。
+- `references`：整文件/空选区固定纯文本 `@path`、多行选区、`end.character === 0`、单行回退、无效路径/范围、缺失 URI、URI+range 去重与数量上限。
+- `editorBridge`：真实 `ws` 客户端完成 `initialize -> notifications/initialized -> at_mentioned`；断开、未握手、Origin、非 opencode 初始化、替换旧连接、stop 清理均不得发送。
+- `ptySession` / `shellProfile`：会话生命周期、输入/尺寸边界、输出 sequence/backlog、dispose；VS Code terminal profile 解析、环境合并、错误回退。
+- `ptyAdapter.integration`：真实加载随包安装的 N-API 预编译 node-pty，运行一个短命令 `echo PTY_NATIVE_OK`，不启动 OpenCode。该文件沿用 `--test-force-exit` 仅用于关闭 node-pty 的 native handle；新增 bridge 测试不依赖它。
+- `webviewInteraction`：行为级模拟 keydown/keypress/keyup、IME、普通 Enter 与 Ctrl+C/Ctrl+V，断言一次 Shift+Enter 只产生一个 LF 且绝不产生 CR；用注入的 fake scheduler 验证 100 次连续 resize 只触发一次 trailing fit、初始/快照 fitNow 即时执行、取消/隐藏/零尺寸不 fit、恢复后重新 fit。测试不加载 xterm 真实 DOM。
+- `extension.integration`：mock VS Code 下验证自动 spawn 一次、profile args/env/cwd、bridge 端口 env 覆盖、ready/attach 实际尺寸与已运行 PTY resize、输入/输出/退出、多行选区走结构化桥接、整文件仅写 `@path` 且不打开文档/不调用 bridge、单行与断开时仅文本无 Enter、bridge 启动失败清理、PTY 退出/移除工作区/dispose 关闭 bridge、untrusted 不启动 bridge、CodeEditors options.selection、工作区配置确认、拒绝工作区配置时不用 workspace 解析的 `vscode.env.shell`；另用 mock 原生 TreeView/DataTransfer 验证多文件整文件仅 `@路径` 不含 `#`、`CodeFiles` 原生路径、`asFile()?.uri`、目录跳过、非法 MIME、无 PTY、untrusted 与异步 `asString` 失败均不误写。
+- `manifest`：契约检查只贡献 `secondarySidebar` 且无 `panel`、TUI/drop 视图顺序与 90/10 `initialSize`、旧 view/命令 ID 保留、VS Code 最低版本 `^1.106.0` 以及 0.0.8 VSIX 文件名。
+
+当前测试数：**128 个通过**（`npm test`，不含单独运行的 1 个 node-pty native smoke）。这些 bridge 测试使用真实 WebSocket 客户端，但仍是协议级 mock，不等于已证明真实 OpenCode TUI 插入成功；`webviewInteraction` 也不等于真实浏览器 IME/拖动 UI 验证。
+
+### 原生加载证据与限制
+
+`npm run smoke:native` 在系统 Node 中真实 `require('@lydell/node-pty')` 并 spawn 短命令，证明预编译 N-API 二进制能加载和创建子进程。
+
+本次构建还额外使用 VS Code 自带的 Electron 43.8.3（`ELECTRON_RUN_AS_NODE=1`，N-API 10，win32-x64）运行同一短命令，结果为 `ok: true`、`exitCode: 0`。这不是完整的 Extension Host 测试，但证明 Electron 的 N-API ABI 能加载该预编译二进制并创建子进程。最终扩展宿主内的运行仍需安装 VSIX 后手工确认。
 
 ### 手工测试清单
 
-1. 打开单根工作区，执行 `npm run compile` 后按 F5；点击底部 OpenCode 图标，确认终端创建且执行了 `opencode`。
-2. 再次打开面板或点击“启动”，确认复用同一终端，没有重复终端。
-3. 在设置中确认 `OpenCode Terminal › Command` 是 machine 作用域；尝试在 `.vscode/settings.json` 覆盖它，确认不生效。
-4. 将 Explorer 中的文件拖到面板，确认列表出现 `@...`，但终端没有立即收到内容。
-5. 在编辑器中选中几行拖入，确认显示 `@文件#行-行`；用“插入”后确认弹窗出现，选择插入后终端只输入文本、不回车。
-6. 在插入确认框选择“复制到剪贴板”，确认剪贴板内容正确。
-7. 关闭 OpenCode 终端，确认状态变为已关闭、引用仍保留；再次启动后引用可继续插入。
-8. 打开多根工作区，点击启动，确认出现工作区选择；分别启动两个工作区，确认各自终端独立。
-9. 打开不受信任的工作区，确认启动和插入被禁止，面板仍能显示。
-10. 尝试添加路径含空格或 `#` 的文件，确认显示明确错误，而不是生成错误引用。
-11. 拖入一段与最近选区不匹配的纯文本，确认被拒绝且不会发送到终端。
-12. 打开面板后切换标签/隐藏面板再回来，确认引用列表仍在。
-13. 启动 OpenCode 后重载扩展宿主/窗口，再次启动或打开面板，确认恢复现有终端且没有重复执行启动命令。
+1. 安装/加载 0.0.8 后 **完整 Reload Window**，打开单根工作区，确认 OpenCode 出现在 Secondary Sidebar（通常为右侧），TUI 在上、下方紧邻小型“拖入文件”原生区域。若视图仍停留在旧位置，使用视图标题菜单的 **Reset Location**。
+2. 确认自动执行 `opencode` 一次；再次打开侧栏不重复 spawn。
+3. 分别点击 TUI 上方视图标题和“拖入文件”视图标题的折叠控件，确认两个视图可独立折叠/展开，且展开后内容仍在；扩展不会新增折叠按钮或改变分隔线布局。
+4. 在 TUI 输入框执行 `Shift+Enter`，确认只换行不提交；普通 `Enter` 提交；`Ctrl+J` 仍换行。使用中文输入法选词时按 `Enter`，确认选词正常、不会被吞掉或误提交。
+5. 从 Explorer 多选文件拖到“拖入文件”区域（根空白或提示项均可）。确认出现去重后的纯文本 `@路径`（不含 `#行号`、不打开文档、不经过桥接）并提示需手动确认，不会执行、不会创建第二个终端。
+6. 如果 Explorer 内部拖拽无法进入 xterm webview，确认扩展给出平台限制提示，而不是宣称 webview 直接拖放一定可用。
+7. 在编辑器选中多行/单行后拖入或使用右键“添加当前选区”：多行在 bridge 可用时结构化插入；单行始终回退为文本 `@文件#行-行` 并提示需手动确认；整文件（右键“添加文件”或命令面板“选择文件插入 @ 引用”）始终为纯文本 `@文件`；无匹配纯文本只提示，不写入。
+8. 有选区时 Ctrl+C 复制，不向 PTY 发 Ctrl+C；无选区时 Ctrl+C 照常中断。
+9. Ctrl+V 粘贴剪贴板内容，不自动回车。
+10. 连续拖动侧栏边缘改变宽度约 2 秒后停手，确认只在停止约 175ms 后发生一次终端重排/PTY resize，而不是拖动过程中每帧重排；首屏仍按真实尺寸显示，隐藏侧栏再打开不应出现 2x1 clamp。拖动过程中输出按旧尺寸临时裁切属已知现象。
+11. 关闭/隐藏再打开侧栏，确认内容通过 snapshot 恢复；重启扩展宿主后确认旧 PTY 结束且没有孤儿进程。
+12. 在设置中修改默认 shell 或 profile，确认出现“重启 PTY 后生效”提示。
+13. 在工作区 `.vscode/settings.json` 写 `terminal.integrated.env.windows`，确认首次启动出现工作区配置确认；选择“仅使用用户配置”后不注入该 env，并确认没有使用工作区 profile 解析出的 `vscode.env.shell`。
+14. 用户默认 profile 只有 `source`、没有 `path` 时选择“仅使用用户配置”，确认明确报错要求补充用户 profile `path`，而不是启动可疑路径。
+15. 未启动 PTY 时直接从原生区域拖入文件，确认只提示先启动/重启，不写入。
+16. 从系统文件管理器拖文件到原生区域，确认没有 `asFile()?.uri` 时只提示，不猜测路径。
+17. 在多根工作区移除当前活动文件夹，确认对应 PTY 被 kill、xterm 缓冲清空，且没有孤儿进程。
+18. 打开不受信任工作区，确认不会 spawn、不会写入，侧栏仍可见。
+19. 拖动两个视图之间的分隔线，确认原生区域可以缩小，TUI 主区域保持可用。
+20. 启动 PTY 后，整文件引用应直接写纯文本 `@路径` 并提示需手动确认；多行选区在 OpenCode 支持内部 editor 协议时显示“已发送引用添加请求（未提交）”。两种情况都没有自动 Enter/Tab。
+21. 检查状态提示没有声称“TUI 已确认插入”；断开桥接或停止 PTY 后再次添加引用，确认不会向旧 session/旧 bridge 发送。

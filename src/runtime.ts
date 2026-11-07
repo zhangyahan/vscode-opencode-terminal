@@ -1,9 +1,11 @@
 /**
  * Pure runtime helpers shared by `extension.ts` and its tests.
  *
- * This module has no dependency on the `vscode` module so the interesting
- * policy decisions (message validation, short-lived selection matching,
- * terminal reuse and stored references) can be tested with plain Node.
+ * This module has no dependency on the `vscode` module so message validation,
+ * selection matching and clipboard/PTY protocol policy can be tested with
+ * plain Node. The reference-list and native-terminal registry helpers are kept
+ * for backwards-compatible tests; 0.0.2 embeds its own PTY and no longer uses
+ * an attachment drawer.
  */
 
 import { formatMention, type TextRange } from './core';
@@ -18,6 +20,10 @@ export const MAX_SELECTION_TEXT_LENGTH = 200_000;
 export const MAX_INSERT_TEXT_LENGTH = 200_000;
 export const MAX_LAUNCH_COMMAND_LENGTH = 500;
 export const SELECTION_TTL_MS = 5 * 60 * 1000;
+export const MAX_PTY_INPUT_LENGTH = 100_000;
+export const MAX_PTY_COLS = 1_000;
+export const MAX_PTY_ROWS = 1_000;
+export const MAX_CLIPBOARD_TEXT_LENGTH = 200_000;
 
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/;
 const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -45,15 +51,32 @@ function boundedString(
 }
 
 export type WebviewInboundMessage =
-  | { readonly type: 'ready' }
+  | { readonly type: 'ready'; readonly cols?: number; readonly rows?: number }
+  | { readonly type: 'attach'; readonly cols?: number; readonly rows?: number }
   | { readonly type: 'start' }
+  | { readonly type: 'restart' }
   | { readonly type: 'focusTerminal' }
+  | { readonly type: 'chooseWorkspace' }
   | { readonly type: 'pickFiles' }
   | { readonly type: 'addActiveSelection' }
   | { readonly type: 'clear' }
+  | { readonly type: 'readClipboard' }
+  | { readonly type: 'copyClipboard'; readonly text: string }
+  | {
+      readonly type: 'ptyInput';
+      readonly sessionId: string;
+      readonly data: string;
+    }
+  | {
+      readonly type: 'ptyResize';
+      readonly sessionId: string;
+      readonly cols: number;
+      readonly rows: number;
+    }
   | {
       readonly type: 'drop';
       readonly uriList?: string;
+      readonly codeUriList?: string;
       readonly resourceUrls?: string;
       readonly codeFiles?: string;
       readonly codeEditors?: string;
@@ -67,6 +90,28 @@ export type WebviewInboundMessage =
 export type WebviewMessageResult =
   | { readonly ok: true; readonly message: WebviewInboundMessage }
   | { readonly ok: false; readonly error: string };
+
+function boundedInteger(
+  value: unknown,
+  minimum: number,
+  maximum: number,
+): value is number {
+  return (
+    typeof value === 'number' &&
+    Number.isSafeInteger(value) &&
+    value >= minimum &&
+    value <= maximum
+  );
+}
+
+function parseSessionId(
+  value: unknown,
+): { readonly ok: true; readonly sessionId: string } | { readonly ok: false; readonly error: string } {
+  if (typeof value !== 'string' || value.length > MAX_ID_LENGTH || !SAFE_ID.test(value)) {
+    return { ok: false, error: 'sessionId is invalid.' };
+  }
+  return { ok: true, sessionId: value };
+}
 
 function parseIds(value: unknown): { readonly ok: true; readonly ids: string[] } | { readonly ok: false; readonly error: string } {
   if (!Array.isArray(value)) {
@@ -105,13 +150,91 @@ export function parseWebviewMessage(raw: unknown): WebviewMessageResult {
   }
 
   switch (type) {
-    case 'ready':
     case 'start':
+    case 'restart':
     case 'focusTerminal':
+    case 'chooseWorkspace':
     case 'pickFiles':
     case 'addActiveSelection':
     case 'clear':
+    case 'readClipboard':
       return { ok: true, message: { type } };
+
+    case 'ready':
+    case 'attach': {
+      if (
+        (raw.cols !== undefined &&
+          !boundedInteger(raw.cols, 1, MAX_PTY_COLS)) ||
+        (raw.rows !== undefined && !boundedInteger(raw.rows, 1, MAX_PTY_ROWS))
+      ) {
+        return { ok: false, error: 'terminal dimensions are outside the supported bounds.' };
+      }
+      return {
+        ok: true,
+        message: {
+          type: type as 'ready' | 'attach',
+          ...(raw.cols === undefined ? {} : { cols: raw.cols }),
+          ...(raw.rows === undefined ? {} : { rows: raw.rows }),
+        },
+      };
+    }
+
+    case 'copyClipboard': {
+      const text = raw.text;
+      if (typeof text !== 'string') {
+        return { ok: false, error: 'text must be a string.' };
+      }
+      if (text.length > MAX_CLIPBOARD_TEXT_LENGTH) {
+        return {
+          ok: false,
+          error: `text exceeds the ${MAX_CLIPBOARD_TEXT_LENGTH} character limit.`,
+        };
+      }
+      return { ok: true, message: { type: 'copyClipboard', text } };
+    }
+
+    case 'ptyInput': {
+      const session = parseSessionId(raw.sessionId);
+      if (!session.ok) {
+        return { ok: false, error: session.error };
+      }
+      // Do not trim or filter: Ctrl+C, ESC and arrow-key sequences are valid.
+      if (typeof raw.data !== 'string' || raw.data.length === 0) {
+        return { ok: false, error: 'PTY input must be a non-empty string.' };
+      }
+      if (raw.data.length > MAX_PTY_INPUT_LENGTH) {
+        return {
+          ok: false,
+          error: `PTY input exceeds the ${MAX_PTY_INPUT_LENGTH} character limit.`,
+        };
+      }
+      return {
+        ok: true,
+        message: { type: 'ptyInput', sessionId: session.sessionId, data: raw.data },
+      };
+    }
+
+    case 'ptyResize': {
+      const session = parseSessionId(raw.sessionId);
+      if (!session.ok) {
+        return { ok: false, error: session.error };
+      }
+      if (
+        !boundedInteger(raw.cols, 1, MAX_PTY_COLS) ||
+        !boundedInteger(raw.rows, 1, MAX_PTY_ROWS)
+      ) {
+        return { ok: false, error: 'PTY resize dimensions are outside the supported bounds.' };
+      }
+      return {
+        ok: true,
+        message: {
+          type: 'ptyResize',
+          sessionId: session.sessionId,
+          cols: raw.cols,
+          rows: raw.rows,
+        },
+      };
+    }
 
     case 'insert':
     case 'copy':
@@ -125,6 +248,7 @@ export function parseWebviewMessage(raw: unknown): WebviewMessageResult {
     case 'drop': {
       const fields = {
         uriList: raw.uriList,
+        codeUriList: raw.codeUriList,
         resourceUrls: raw.resourceUrls,
         codeFiles: raw.codeFiles,
         codeEditors: raw.codeEditors,
@@ -134,6 +258,7 @@ export function parseWebviewMessage(raw: unknown): WebviewMessageResult {
       const message: {
         type: 'drop';
         uriList?: string;
+        codeUriList?: string;
         resourceUrls?: string;
         codeFiles?: string;
         codeEditors?: string;

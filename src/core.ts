@@ -56,6 +56,7 @@ export type FormatMentionResult = FormatMentionSuccess | FormatMentionFailure;
 
 export type DropSource =
   | 'text/uri-list'
+  | 'application/vnd.code.uri-list'
   | 'ResourceURLs'
   | 'CodeFiles'
   | 'CodeEditors';
@@ -63,9 +64,13 @@ export type DropSource =
 export type DropWarningCode =
   | 'invalid-json'
   | 'invalid-uri'
+  | 'invalid-path'
   | 'unsupported-scheme'
   | 'invalid-selection'
   | 'unsupported-payload';
+
+/** Upper bound for entries accepted from one JSON drop field. */
+export const MAX_DROP_ENTRIES = 500;
 
 export interface DropWarning {
   readonly code: DropWarningCode;
@@ -75,10 +80,16 @@ export interface DropWarning {
 
 export interface DropTarget {
   /**
-   * The URI exactly as supplied by VS Code (percent escapes are preserved).
-   * Only `file:` URIs are returned.
+   * Native absolute filesystem path, only produced for CodeFiles entries.
+   * The string is not decoded or URI-parsed; the extension host converts it
+   * with `vscode.Uri.file(path)`. `path` and `uri` are mutually exclusive.
    */
-  readonly uri: string;
+  readonly path?: string;
+  /**
+   * The URI exactly as supplied by VS Code (percent escapes are preserved).
+   * Only `file:` URIs are returned. `path` and `uri` are mutually exclusive.
+   */
+  readonly uri?: string;
   /** Zero-based selection hint, when the payload contains one. */
   readonly range?: TextRange;
   readonly source: DropSource;
@@ -210,7 +221,7 @@ function isPosition(value: unknown): value is TextPosition {
   );
 }
 
-interface RangeConversion {
+export interface RangeConversion {
   readonly ok: boolean;
   readonly lines?: MentionLines;
   readonly message?: string;
@@ -269,6 +280,15 @@ function convertRange(range: TextRange): RangeConversion {
       endLine: lastLine + 1,
     },
   };
+}
+
+/**
+ * Converts a zero-based VS Code range to one-based inclusive mention lines.
+ * Exposed separately from `formatMention` so the structured editor bridge can
+ * use exactly the same range semantics as the text fallback.
+ */
+export function rangeToMentionLines(range: TextRange): RangeConversion {
+  return convertRange(range);
 }
 
 /**
@@ -546,12 +566,35 @@ function readSelection(
   source: DropSource,
   warnings: DropWarning[],
 ): TextRange | undefined {
+  // VS Code's CodeEditors entries can carry the editor selection either
+  // directly or inside `options`. `options.selection` is the common shape for
+  // drag operations started from an editor.
+  const options =
+    record.options !== null &&
+    typeof record.options === 'object' &&
+    !Array.isArray(record.options)
+      ? (record.options as Record<string, unknown>)
+      : undefined;
+
   let raw = record.selection;
   if (raw === undefined) {
     raw = record.range;
   }
   if (raw === undefined && Array.isArray(record.selections) && record.selections.length > 0) {
     raw = record.selections[0];
+  }
+  if (raw === undefined && options !== undefined) {
+    raw = options.selection;
+    if (raw === undefined) {
+      raw = options.range;
+    }
+    if (
+      raw === undefined &&
+      Array.isArray(options.selections) &&
+      options.selections.length > 0
+    ) {
+      raw = options.selections[0];
+    }
   }
   if (raw === undefined) {
     return undefined;
@@ -656,6 +699,80 @@ function makeTarget(
     : { uri, range, source };
 }
 
+function makePathTarget(
+  rawPath: unknown,
+  source: DropSource,
+  range: TextRange | undefined,
+  warnings: DropWarning[],
+): DropTarget | undefined {
+  if (typeof rawPath !== 'string') {
+    warnings.push(
+      dropWarning('invalid-path', `${source} entry is not a path string.`, source),
+    );
+    return undefined;
+  }
+
+  if (rawPath.trim().length === 0) {
+    warnings.push(
+      dropWarning('invalid-path', `${source} entry contains an empty path.`, source),
+    );
+    return undefined;
+  }
+  if (hasControlCharacters(rawPath)) {
+    warnings.push(
+      dropWarning(
+        'invalid-path',
+        `${source} entry contains control characters and was ignored.`,
+        source,
+      ),
+    );
+    return undefined;
+  }
+  if (WINDOWS_DRIVE_RELATIVE.test(rawPath)) {
+    warnings.push(
+      dropWarning(
+        'invalid-path',
+        `${source} entry is drive-relative; only absolute paths are accepted.`,
+        source,
+      ),
+    );
+    return undefined;
+  }
+  if (absoluteFlavor(rawPath) === undefined) {
+    warnings.push(
+      dropWarning(
+        'invalid-path',
+        `${source} entry is not an absolute POSIX, Windows or UNC path.`,
+        source,
+      ),
+    );
+    return undefined;
+  }
+
+  return range === undefined
+    ? { path: rawPath, source }
+    : { path: rawPath, range, source };
+}
+
+/**
+ * A stable key used to deduplicate a native path and a file URI independently
+ * while preserving the exact payload text. Native Windows paths compare
+ * case-insensitively, matching the platform; POSIX paths stay case-sensitive.
+ */
+function targetKey(target: DropTarget): string {
+  if (target.path !== undefined) {
+    const flavor = absoluteFlavor(target.path);
+    if (flavor !== undefined) {
+      const normalized = normalizeAbsolute(target.path, flavor);
+      return `path:${flavor}:${
+        flavor === 'windows' ? normalized.toLowerCase() : normalized
+      }`;
+    }
+    return `path:raw:${target.path}`;
+  }
+  return `uri:${target.uri ?? ''}`;
+}
+
 /**
  * Parses a VS Code drop payload without decoding file URIs.
  *
@@ -686,50 +803,149 @@ export function parseDropPayload(payload: unknown): DropParseResult {
   const record = payload as Record<string, unknown>;
   const files = new Map<string, DropTarget>();
 
+  const addTarget = (target: DropTarget): void => {
+    const key = targetKey(target);
+    const existing = files.get(key);
+    if (existing === undefined) {
+      files.set(key, target);
+      return;
+    }
+
+    // Prefer a richer entry that carries a selection over one that does not.
+    if (existing.range === undefined && target.range !== undefined) {
+      files.set(key, { ...existing, range: target.range });
+    }
+  };
+
   const addUri = (
     rawUri: unknown,
     source: DropSource,
     range?: TextRange,
   ): void => {
     const target = makeTarget(rawUri, source, range, warnings);
-    if (target === undefined) {
-      return;
-    }
-
-    const existing = files.get(target.uri);
-    if (existing === undefined) {
-      files.set(target.uri, target);
-      return;
-    }
-
-    // Prefer a richer entry that carries a selection over one that does not.
-    if (existing.range === undefined && target.range !== undefined) {
-      files.set(target.uri, { ...existing, range: target.range });
+    if (target !== undefined) {
+      addTarget(target);
     }
   };
 
-  const uriList = readMime(record, ['uri-list', 'text/uri-list', 'uriList']);
-  if (uriList !== undefined) {
-    if (typeof uriList === 'string') {
-      for (const line of uriList.split(/\r?\n/)) {
+  const addPath = (
+    rawPath: unknown,
+    source: DropSource,
+    range?: TextRange,
+  ): void => {
+    const target = makePathTarget(rawPath, source, range, warnings);
+    if (target !== undefined) {
+      addTarget(target);
+    }
+  };
+
+  /**
+   * CodeFiles is documented by VS Code as an array of native absolute paths.
+   * Older payloads/tests used file: URIs there, so accept both, but never
+   * reinterpret an arbitrary relative string as a path.
+   */
+  const addCodeFileEntry = (raw: unknown, range?: TextRange): void => {
+    if (typeof raw !== 'string') {
+      addUri(raw, 'CodeFiles', range);
+      return;
+    }
+
+    const value = raw.trim();
+    if (absoluteFlavor(value) !== undefined) {
+      addPath(value, 'CodeFiles', range);
+      return;
+    }
+    if (WINDOWS_DRIVE_RELATIVE.test(value)) {
+      addPath(value, 'CodeFiles', range);
+      return;
+    }
+
+    const match = URI_SCHEME.exec(value);
+    if (match !== null) {
+      if (match[1].toLowerCase() === 'file') {
+        addUri(value, 'CodeFiles', range);
+      } else {
+        warnings.push(
+          dropWarning(
+            'unsupported-scheme',
+            `Unsupported URI scheme "${match[1]}:". Only file: URIs are accepted.`,
+            'CodeFiles',
+          ),
+        );
+      }
+      return;
+    }
+
+    // Produces a warning for relative paths and empty values.
+    addPath(value, 'CodeFiles', range);
+  };
+
+  const addUriListValue = (raw: unknown, source: DropSource): void => {
+    if (typeof raw === 'string') {
+      const text = raw.trim();
+      if (text.startsWith('[')) {
+        const decoded = decodeJson(raw, source, warnings);
+        if (Array.isArray(decoded)) {
+          for (const entry of decoded.slice(0, MAX_DROP_ENTRIES)) {
+            addUri(entry, source);
+          }
+        } else if (typeof decoded === 'string') {
+          addUri(decoded, source);
+        } else if (decoded !== undefined) {
+          warnings.push(
+            dropWarning(
+              'unsupported-payload',
+              `${source} JSON must be an array of URI strings.`,
+              source,
+            ),
+          );
+        }
+        return;
+      }
+
+      for (const line of text.split(/\r?\n/)) {
         const value = line.trim();
         if (value.length === 0 || value.startsWith('#')) {
           continue;
         }
-        addUri(value, 'text/uri-list');
+        addUri(value, source);
       }
-    } else if (Array.isArray(uriList)) {
-      for (const value of uriList) {
-        addUri(value, 'text/uri-list');
+      return;
+    }
+
+    if (Array.isArray(raw)) {
+      for (const value of raw.slice(0, MAX_DROP_ENTRIES)) {
+        addUri(value, source);
       }
-    } else {
-      warnings.push(
-        dropWarning(
-          'unsupported-payload',
-          'text/uri-list must be a string or an array of URI strings.',
-          'text/uri-list',
-        ),
-      );
+      return;
+    }
+
+    warnings.push(
+      dropWarning(
+        'unsupported-payload',
+        `${source} must be a string or an array of URI strings.`,
+        source,
+      ),
+    );
+  };
+
+  // The standard URI list is processed first, then VS Code's internal list.
+  // Both are merged (not first-non-empty) so a multi-select drop cannot lose
+  // files when only one of the two MIME fields is complete.
+  const uriListFields: ReadonlyArray<{
+    readonly names: readonly string[];
+    readonly source: DropSource;
+  }> = [
+    { names: ['text/uri-list', 'uri-list', 'uriList'], source: 'text/uri-list' },
+    {
+      names: ['application/vnd.code.uri-list'],
+      source: 'application/vnd.code.uri-list',
+    },
+  ];
+  for (const field of uriListFields) {
+    const raw = readMime(record, field.names);
+    if (raw !== undefined) {
+      addUriListValue(raw, field.source);
     }
   }
 
@@ -753,10 +969,25 @@ export function parseDropPayload(payload: unknown): DropParseResult {
       continue;
     }
 
-    const entries = Array.isArray(decoded) ? decoded : [decoded];
+    const allEntries = Array.isArray(decoded) ? decoded : [decoded];
+    if (allEntries.length > MAX_DROP_ENTRIES) {
+      warnings.push(
+        dropWarning(
+          'unsupported-payload',
+          `${field.source} contains more than ${MAX_DROP_ENTRIES} entries; extra entries were ignored.`,
+          field.source,
+        ),
+      );
+    }
+    const entries = allEntries.slice(0, MAX_DROP_ENTRIES);
+
     for (const entry of entries) {
       if (typeof entry === 'string') {
-        addUri(entry, field.source);
+        if (field.source === 'CodeFiles') {
+          addCodeFileEntry(entry);
+        } else {
+          addUri(entry, field.source);
+        }
         continue;
       }
 
@@ -773,6 +1004,15 @@ export function parseDropPayload(payload: unknown): DropParseResult {
 
       const item = entry as Record<string, unknown>;
       const range = readSelection(item, field.source, warnings);
+
+      if (field.source === 'CodeFiles') {
+        const pathValue = firstDefined(item, ['path', 'fsPath']);
+        if (typeof pathValue === 'string') {
+          addCodeFileEntry(pathValue, range);
+          continue;
+        }
+      }
+
       const uriValue = firstDefined(item, ['uri', 'url', 'resource', 'external']);
       const uri = uriFromValue(uriValue);
 

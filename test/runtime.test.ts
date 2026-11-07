@@ -5,6 +5,7 @@ import {
   MAX_ATTACHMENTS,
   MAX_DROP_FIELD_LENGTH,
   MAX_LAUNCH_COMMAND_LENGTH,
+  MAX_PTY_INPUT_LENGTH,
   MAX_WEBVIEW_IDS,
   SELECTION_TTL_MS,
   TerminalRegistry,
@@ -54,11 +55,13 @@ test('parseWebviewMessage accepts simple and drop messages', () => {
   const drop = parseWebviewMessage({
     type: 'drop',
     uriList: 'file:///work/a.ts',
+    codeUriList: 'file:///work/b.ts',
     plainText: 'const a = 1;',
   });
   assert.equal(drop.ok, true);
   if (drop.ok && drop.message.type === 'drop') {
     assert.equal(drop.message.uriList, 'file:///work/a.ts');
+    assert.equal(drop.message.codeUriList, 'file:///work/b.ts');
     assert.equal(drop.message.plainText, 'const a = 1;');
   }
 });
@@ -412,4 +415,73 @@ test('selection cache expires old entries and caps its size', () => {  const old
 test('MAX_ATTACHMENTS is exposed for UI and validation', () => {
   assert.equal(Number.isSafeInteger(MAX_ATTACHMENTS), true);
   assert.equal(MAX_ATTACHMENTS > 0, true);
+});
+
+test('parseWebviewMessage validates PTY input, resize, attach and clipboard messages', () => {
+  const control = parseWebviewMessage({
+    type: 'ptyInput',
+    sessionId: 'session-1',
+    data: '\u0003\u001b[A',
+  });
+  assert.equal(control.ok, true);
+  if (control.ok && control.message.type === 'ptyInput') {
+    assert.equal(control.message.data, '\u0003\u001b[A');
+  }
+
+  assert.equal(
+    parseWebviewMessage({ type: 'ptyInput', sessionId: 'bad id', data: 'x' }).ok,
+    false,
+  );
+  assert.equal(
+    parseWebviewMessage({ type: 'ptyInput', sessionId: 'session-1', data: '' }).ok,
+    false,
+  );
+  assert.equal(
+    parseWebviewMessage({
+      type: 'ptyInput',
+      sessionId: 'session-1',
+      data: 'a'.repeat(MAX_PTY_INPUT_LENGTH + 1),
+    }).ok,
+    false,
+  );
+
+  assert.equal(
+    parseWebviewMessage({
+      type: 'ptyResize',
+      sessionId: 'session-1',
+      cols: 120,
+      rows: 40,
+    }).ok,
+    true,
+  );
+  assert.equal(
+    parseWebviewMessage({
+      type: 'ptyResize',
+      sessionId: 'session-1',
+      cols: 0,
+      rows: 40,
+    }).ok,
+    false,
+  );
+
+  const ready = parseWebviewMessage({ type: 'ready', cols: 101, rows: 19 });
+  assert.equal(ready.ok, true);
+  if (ready.ok && ready.message.type === 'ready') {
+    assert.equal(ready.message.cols, 101);
+    assert.equal(ready.message.rows, 19);
+  }
+  assert.equal(
+    parseWebviewMessage({ type: 'ready', cols: 0, rows: 19 }).ok,
+    false,
+  );
+  assert.equal(
+    parseWebviewMessage({ type: 'attach', cols: 80, rows: 24 }).ok,
+    true,
+  );
+  assert.equal(
+    parseWebviewMessage({ type: 'attach', cols: 0, rows: 24 }).ok,
+    false,
+  );
+  assert.equal(parseWebviewMessage({ type: 'copyClipboard', text: 'x' }).ok, true);
+  assert.equal(parseWebviewMessage({ type: 'copyClipboard', text: 1 }).ok, false);
 });

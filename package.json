@@ -1,8 +1,8 @@
 {
   "name": "vscode-opencode-terminal",
   "displayName": "OpenCode Terminal",
-  "description": "Run OpenCode in a VS Code integrated terminal and turn dropped files/selections into OpenCode mentions.",
-  "version": "0.0.1",
+  "description": "Run OpenCode's real TUI inside the VS Code Secondary Sidebar using xterm.js + node-pty, with a native file drop target and @mentions.",
+  "version": "0.0.8",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -10,7 +10,7 @@
     "url": "https://github.com/zhangyahan/vscode-opencode-terminal.git"
   },
   "engines": {
-    "vscode": "^1.94.0"
+    "vscode": "^1.106.0"
   },
   "categories": [
     "Other"
@@ -19,97 +19,99 @@
     "opencode",
     "terminal",
     "panel",
-    "mentions",
-    "webview"
+    "pty",
+    "xterm",
+    "mentions"
   ],
   "main": "./out/src/extension.js",
   "activationEvents": [
-    "onView:opencodeTerminal.main"
+    "onView:opencodeTerminal.main",
+    "onView:opencodeTerminal.drop",
+    "onCommand:opencodeTerminal.open",
+    "onCommand:opencodeTerminal.start",
+    "onCommand:opencodeTerminal.focusTerminal",
+    "onCommand:opencodeTerminal.addSelection",
+    "onCommand:opencodeTerminal.addFile",
+    "onCommand:opencodeTerminal.pickFiles",
+    "onCommand:opencodeTerminal.copyAll",
+    "onCommand:opencodeTerminal.clear"
   ],
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
-      "description": "在限制模式下可以查看面板和引用，但扩展不会启动 OpenCode，也不会向终端插入内容。"
+      "description": "限制模式下可以查看侧栏，但扩展不会启动 PTY、读取剪贴板或向终端写入任何内容。"
     }
   },
   "contributes": {
     "viewsContainers": {
-      "panel": [
+      "secondarySidebar": [
         {
-          "id": "opencodeTerminal",
+          "id": "opencodeTerminalSecondary",
           "title": "OpenCode",
           "icon": "media/opencode.svg"
         }
       ]
     },
     "views": {
-      "opencodeTerminal": [
+      "opencodeTerminalSecondary": [
         {
           "type": "webview",
           "id": "opencodeTerminal.main",
           "name": "OpenCode",
-          "contextualTitle": "OpenCode"
+          "contextualTitle": "OpenCode",
+          "initialSize": 90
+        },
+        {
+          "type": "tree",
+          "id": "opencodeTerminal.drop",
+          "name": "拖入文件",
+          "contextualTitle": "OpenCode 拖入文件",
+          "initialSize": 10
         }
       ]
     },
     "commands": [
       {
         "command": "opencodeTerminal.open",
-        "title": "OpenCode: 打开面板"
+        "title": "OpenCode: 打开侧栏",
+        "icon": "$(terminal)"
       },
       {
         "command": "opencodeTerminal.start",
-        "title": "OpenCode: 启动（当前工作区）",
+        "title": "OpenCode: 启动/复用 PTY",
         "icon": "$(play)"
       },
       {
         "command": "opencodeTerminal.focusTerminal",
-        "title": "OpenCode: 显示终端",
+        "title": "OpenCode: 聚焦嵌入式终端",
         "icon": "$(terminal)"
       },
       {
         "command": "opencodeTerminal.addSelection",
-        "title": "OpenCode: 添加当前选区/文件为引用",
+        "title": "OpenCode: 添加当前选区为 @ 引用",
         "icon": "$(selection)"
       },
       {
         "command": "opencodeTerminal.addFile",
-        "title": "OpenCode: 添加文件为引用"
+        "title": "OpenCode: 添加文件为 @ 引用"
       },
       {
         "command": "opencodeTerminal.pickFiles",
-        "title": "OpenCode: 从磁盘添加文件引用",
+        "title": "OpenCode: 选择文件插入 @ 引用",
         "icon": "$(file-add)"
       },
       {
         "command": "opencodeTerminal.copyAll",
-        "title": "OpenCode: 复制全部引用",
+        "title": "OpenCode: 复制最近一次 @ 引用",
         "icon": "$(copy)"
       },
       {
         "command": "opencodeTerminal.clear",
-        "title": "OpenCode: 清空引用",
+        "title": "OpenCode: 清除终端滚动缓冲",
         "icon": "$(clear-all)"
       }
     ],
     "menus": {
-      "view/title": [
-        {
-          "command": "opencodeTerminal.start",
-          "when": "view == opencodeTerminal.main",
-          "group": "navigation@1"
-        },
-        {
-          "command": "opencodeTerminal.focusTerminal",
-          "when": "view == opencodeTerminal.main",
-          "group": "navigation@2"
-        },
-        {
-          "command": "opencodeTerminal.clear",
-          "when": "view == opencodeTerminal.main",
-          "group": "navigation@3"
-        }
-      ],
       "editor/context": [
         {
           "command": "opencodeTerminal.addSelection",
@@ -132,20 +134,34 @@
           "type": "string",
           "default": "opencode",
           "scope": "machine",
-          "markdownDescription": "在 VS Code 集成终端中执行的 **shell 命令**（machine 作用域，工作区设置不能覆盖）。默认 `opencode`。禁止包含换行或控制字符；扩展不会验证该命令是否存在，也不会通过 HTTP 检查 OpenCode 版本。"
+          "markdownDescription": "在嵌入式 PTY 中执行的 **shell 命令**（machine 作用域，工作区设置不能覆盖）。默认 `opencode`。禁止换行或控制字符；扩展不会验证该命令是否存在，也不会通过 HTTP 探测 OpenCode 版本。"
         }
       }
     }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p tsconfig.json",
-    "check": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run compile && node --test out/test/core.test.js out/test/runtime.test.js out/test/extension.integration.test.js"
+    "build:webview": "node scripts/build-webview.mjs",
+    "compile": "npm run build:webview && tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.webview.json --noEmit",
+    "build": "npm run check && npm run compile",
+    "test": "npm run compile && node --test out/test/core.test.js out/test/runtime.test.js out/test/ptySession.test.js out/test/shellProfile.test.js out/test/references.test.js out/test/editorBridge.test.js out/test/webviewInteraction.test.js out/test/extension.integration.test.js out/test/manifest.test.js",
+    "test:native": "npm run compile && node --test --test-force-exit out/test/ptyAdapter.integration.test.js",
+    "smoke:native": "npm run compile && node --test --test-force-exit out/test/ptyAdapter.integration.test.js",
+    "package": "npm run compile && vsce package --target win32-x64 --out vscode-opencode-terminal-0.0.8-win32-x64.vsix"
+  },
+  "dependencies": {
+    "@lydell/node-pty": "1.2.0-beta.18",
+    "ws": "8.22.1"
   },
   "devDependencies": {
-    "@types/node": "^20.14.0",
-    "@types/vscode": "^1.94.0",
-    "typescript": "^5.6.0"
+    "@types/node": "20.19.43",
+    "@types/vscode": "1.106.0",
+    "@types/ws": "8.18.2",
+    "@vscode/vsce": "3.9.2",
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/xterm": "6.0.0",
+    "esbuild": "0.28.2",
+    "typescript": "5.9.3"
   }
 }

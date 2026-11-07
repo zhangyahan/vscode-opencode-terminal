@@ -234,6 +234,30 @@ test('parseDropPayload extracts a CodeEditors resource and selection', () => {
   assert.deepEqual(result.warnings, []);
 });
 
+test('parseDropPayload reads CodeEditors options.selection without losing line ranges', () => {
+  const result = parseDropPayload({
+    CodeEditors: JSON.stringify([
+      {
+        resource: 'file:///work/src/editor.ts',
+        options: {
+          selection: {
+            start: { line: 10, character: 4 },
+            end: { line: 12, character: 0 },
+          },
+        },
+      },
+    ]),
+  });
+
+  assert.equal(result.files.length, 1);
+  assert.equal(result.files[0].uri, 'file:///work/src/editor.ts');
+  assert.deepEqual(result.files[0].range, {
+    start: { line: 10, character: 4 },
+    end: { line: 12, character: 0 },
+  });
+  assert.deepEqual(result.warnings, []);
+});
+
 test('parseDropPayload rebuilds a file URI from URI components without decoding', () => {
   const result = parseDropPayload({
     CodeEditors: [
@@ -398,4 +422,112 @@ test('parseDropPayload warns about file URIs with no path or control characters'
     result.warnings.map((warning) => warning.code),
     ['invalid-uri', 'invalid-uri', 'invalid-uri', 'invalid-uri'],
   );
+});
+
+test('parseDropPayload treats real CodeFiles as native Windows absolute paths', () => {
+  const result = parseDropPayload({
+    CodeFiles: JSON.stringify([
+      'C:\\Work\\src\\a.ts',
+      'C:\\Work\\src\\b.ts',
+      'C:\\Work\\src\\a.ts',
+    ]),
+  });
+
+  assert.deepEqual(
+    result.files.map((file) => file.path),
+    ['C:\\Work\\src\\a.ts', 'C:\\Work\\src\\b.ts'],
+  );
+  assert.equal(result.files[0].uri, undefined);
+  assert.equal(result.files[0].source, 'CodeFiles');
+  assert.deepEqual(result.warnings, []);
+});
+
+test('parseDropPayload accepts POSIX and UNC CodeFiles paths', () => {
+  const result = parseDropPayload({
+    CodeFiles: [
+      '/work/src/a.ts',
+      '\\\\server\\share\\src\\b.ts',
+      '//server/share/src/c.ts',
+    ],
+  });
+
+  assert.deepEqual(result.files.map((file) => file.path), [
+    '/work/src/a.ts',
+    '\\\\server\\share\\src\\b.ts',
+    '//server/share/src/c.ts',
+  ]);
+  assert.ok(result.files.every((file) => file.uri === undefined));
+});
+
+test('parseDropPayload keeps file URI compatibility in CodeFiles without decoding', () => {
+  const result = parseDropPayload({
+    CodeFiles: ['file:///c%3A/Work/a%20b.ts'],
+  });
+
+  assert.equal(result.files.length, 1);
+  assert.equal(result.files[0].uri, 'file:///c%3A/Work/a%20b.ts');
+  assert.equal(result.files[0].path, undefined);
+});
+
+test('parseDropPayload rejects relative, drive-relative, control and dangerous CodeFiles paths', () => {
+  const result = parseDropPayload({
+    CodeFiles: [
+      'src/relative.ts',
+      'C:drive-relative.ts',
+      'C:\\Work\\a\u0000b.ts',
+      'javascript:alert(1)',
+      'http://example.com/a.ts',
+      'C:\\Work\\ok.ts',
+    ],
+  });
+
+  assert.deepEqual(result.files.map((file) => file.path), ['C:\\Work\\ok.ts']);
+  assert.deepEqual(
+    result.warnings.map((warning) => warning.code),
+    [
+      'invalid-path',
+      'invalid-path',
+      'invalid-path',
+      'unsupported-scheme',
+      'unsupported-scheme',
+    ],
+  );
+});
+
+test('parseDropPayload never turns text/plain into CodeFiles paths', () => {
+  const result = parseDropPayload({
+    'text/plain': 'C:\\Work\\src\\a.ts',
+    CodeFiles: JSON.stringify(['C:\\Work\\src\\b.ts']),
+  });
+
+  assert.deepEqual(result.files.map((file) => file.path), ['C:\\Work\\src\\b.ts']);
+  assert.equal(result.plainText, 'C:\\Work\\src\\a.ts');
+});
+
+test('parseDropPayload merges text/uri-list with internal application/vnd.code.uri-list', () => {
+  const result = parseDropPayload({
+    'text/uri-list': 'file:///work/a%20b.ts\r\nfile:///work/shared.ts',
+    'application/vnd.code.uri-list': 'file:///work/shared.ts\r\nfile:///work/c.ts',
+  });
+
+  assert.deepEqual(result.files.map((file) => file.uri), [
+    'file:///work/a%20b.ts',
+    'file:///work/shared.ts',
+    'file:///work/c.ts',
+  ]);
+  assert.equal(result.files[0].source, 'text/uri-list');
+  assert.equal(result.files[2].source, 'application/vnd.code.uri-list');
+});
+
+test('parseDropPayload deduplicates Windows paths case-insensitively but not POSIX paths', () => {
+  const windows = parseDropPayload({
+    CodeFiles: ['C:\\Work\\A.ts', 'c:/work/a.ts'],
+  });
+  assert.equal(windows.files.length, 1);
+  assert.equal(windows.files[0].path, 'C:\\Work\\A.ts');
+
+  const posix = parseDropPayload({
+    CodeFiles: ['/work/A.ts', '/work/a.ts'],
+  });
+  assert.equal(posix.files.length, 2);
 });
