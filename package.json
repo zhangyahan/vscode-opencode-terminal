@@ -1,6 +1,6 @@
 {
   "name": "vscode-opencode-terminal",
-  "displayName": "OpenCode Terminal",
+  "displayName": "OpenCode Terminal by ZhangYahan",
   "description": "Run OpenCode's real TUI inside the VS Code Secondary Sidebar using xterm.js + node-pty, with a native file drop target and @mentions.",
   "version": "0.0.9",
   "publisher": "zhangyahan",

@@ -1,4 +1,4 @@
-# OpenCode Terminal for VS Code
+# OpenCode Terminal by ZhangYahan
 
 在 VS Code **Secondary Sidebar（辅助侧边栏，默认位于窗口右侧）**中直接运行 **OpenCode 的真实 TUI**。同一个 `opencodeTerminalSecondary` 容器中，上方是 xterm/OpenCode webview 主区域，下方紧邻一个小型原生 **“拖入文件”** TreeView：把 Explorer 中选中的多个文件拖到该原生区域，0.0.9 会始终以纯文本 `@路径` 插入**整文件**引用；只有多行编辑器选区才通过 OpenCode 内部 editor WebSocket 结构化插入，单行选区回退为 `@路径#行-行`。所有情况都**不会按回车/Tab，也不会执行任意拖入文本**，引用需在 OpenCode 中手动确认。
 
@@ -214,7 +214,7 @@ npm run package      # 生成 win32-x64 VSIX
 - `extension.integration`：mock VS Code 下验证自动 spawn 一次、profile args/env/cwd、bridge 端口 env 覆盖、ready/attach 实际尺寸与已运行 PTY resize、输入/输出/退出、多行选区走结构化桥接、整文件仅写 `@path` 且不打开文档/不调用 bridge、单行与断开时仅文本无 Enter、bridge 启动失败清理、PTY 退出/移除工作区/dispose 关闭 bridge、untrusted 不启动 bridge、CodeEditors options.selection、工作区配置确认、拒绝工作区配置时不用 workspace 解析的 `vscode.env.shell`；旧 `readClipboard` 消息被拒绝且不读取剪贴板、不回发 `pasteText`；另用 mock 原生 TreeView/DataTransfer 验证多文件整文件仅 `@路径` 不含 `#`、`CodeFiles` 原生路径、`asFile()?.uri`、目录跳过、非法 MIME、无 PTY、untrusted 与异步 `asString` 失败均不误写。
 - `manifest`：契约检查只贡献 `secondarySidebar` 且无 `panel`、TUI/drop 视图顺序与 90/10 `initialSize`、旧 view/命令 ID 保留、VS Code 最低版本 `^1.106.0`、0.0.9 VSIX 文件名，以及 Marketplace publisher/安装 ID 为 `zhangyahan.vscode-opencode-terminal`。
 
-当前测试数：**133 个通过**（`npm test`，不含单独运行的 1 个 node-pty native smoke）。这些 bridge 测试使用真实 WebSocket 客户端，但仍是协议级 mock，不等于已证明真实 OpenCode TUI 插入成功；`webviewInteraction` 也不等于真实浏览器 IME、剪贴板或拖动 UI 验证。
+当前测试数：**134 个通过**（`npm test`，不含单独运行的 1 个 node-pty native smoke）。这些 bridge 测试使用真实 WebSocket 客户端，但仍是协议级 mock，不等于已证明真实 OpenCode TUI 插入成功；`webviewInteraction` 也不等于真实浏览器 IME、剪贴板或拖动 UI 验证。
 
 ### 原生加载证据与限制
 

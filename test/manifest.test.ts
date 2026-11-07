@@ -17,6 +17,8 @@ interface ViewContribution {
 }
 
 interface Manifest {
+  readonly name: string;
+  readonly displayName: string;
   readonly version: string;
   readonly publisher: string;
   readonly description: string;
@@ -151,6 +153,25 @@ test('version and packaging target 0.0.9 consistently', () => {
   const packageScript = manifest.scripts?.package ?? '';
   assert.match(packageScript, /vscode-opencode-terminal-0\.0\.9-win32-x64\.vsix/);
   assert.doesNotMatch(packageScript, /0\.0\.8/);
+});
+
+test('marketplace display name is unique without changing IDs or view titles', () => {
+  assert.equal(manifest.displayName, 'OpenCode Terminal by ZhangYahan');
+  assert.notEqual(manifest.displayName, 'OpenCode Terminal');
+
+  assert.equal(manifest.name, 'vscode-opencode-terminal');
+  assert.equal(manifest.publisher, 'zhangyahan');
+  assert.equal(
+    `${manifest.publisher}.${manifest.name}`,
+    'zhangyahan.vscode-opencode-terminal',
+  );
+
+  const container = manifest.contributes.viewsContainers?.secondarySidebar?.[0];
+  assert.equal(container?.title, 'OpenCode');
+  assert.equal(manifest.contributes.views?.[NEW_CONTAINER_ID]?.[0]?.name, 'OpenCode');
+
+  const readme = readFileSync(resolvePath(projectRoot, 'README.md'), 'utf8');
+  assert.match(readme, /^# OpenCode Terminal by ZhangYahan$/m);
 });
 
 test('marketplace publisher and installation ID target zhangyahan', () => {
