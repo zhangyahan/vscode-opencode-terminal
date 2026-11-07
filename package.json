@@ -2,7 +2,7 @@
   "name": "vscode-opencode-terminal",
   "displayName": "OpenCode Terminal",
   "description": "Run OpenCode's real TUI inside the VS Code Secondary Sidebar using xterm.js + node-pty, with a native file drop target and @mentions.",
-  "version": "0.0.8",
+  "version": "0.0.9",
   "publisher": "zhangyahan",
   "license": "MIT",
   "repository": {
@@ -39,7 +39,7 @@
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
-      "description": "限制模式下可以查看侧栏，但扩展不会启动 PTY、读取剪贴板或向终端写入任何内容。"
+      "description": "限制模式下可以查看侧栏，但扩展不会启动 PTY 或向终端写入任何内容。"
     }
   },
   "contributes": {
@@ -148,7 +148,7 @@
     "test": "npm run compile && node --test out/test/core.test.js out/test/runtime.test.js out/test/ptySession.test.js out/test/shellProfile.test.js out/test/references.test.js out/test/editorBridge.test.js out/test/webviewInteraction.test.js out/test/extension.integration.test.js out/test/manifest.test.js",
     "test:native": "npm run compile && node --test --test-force-exit out/test/ptyAdapter.integration.test.js",
     "smoke:native": "npm run compile && node --test --test-force-exit out/test/ptyAdapter.integration.test.js",
-    "package": "npm run compile && vsce package --target win32-x64 --out vscode-opencode-terminal-0.0.8-win32-x64.vsix"
+    "package": "npm run compile && vsce package --target win32-x64 --out vscode-opencode-terminal-0.0.9-win32-x64.vsix"
   },
   "dependencies": {
     "@lydell/node-pty": "1.2.0-beta.18",

@@ -5,12 +5,14 @@ import {
   FIT_DEBOUNCE_MS,
   NEWLINE_INPUT,
   TerminalFitDebouncer,
+  applyTerminalKey,
   canFitTerminal,
   decideTerminalKey,
   isImeCompositionEvent,
   type TerminalFitEnvironment,
   type TerminalKeyDecision,
   type TerminalKeyEventLike,
+  type TerminalKeyMessage,
   type TimerScheduler,
 } from '../media/src/interaction';
 
@@ -60,24 +62,50 @@ class FakeScheduler implements TimerScheduler {
 interface SimulatedWebview {
   readonly decisions: TerminalKeyDecision[];
   readonly writes: string[];
-  send(event: TerminalKeyEventLike, hasSelection?: boolean): TerminalKeyDecision;
+  readonly posts: TerminalKeyMessage[];
+  readonly handled: boolean[];
+  preventDefaults: number;
+  send(
+    event: TerminalKeyEventLike,
+    hasSelection?: boolean,
+    selection?: string,
+  ): TerminalKeyDecision;
+  /** Models the browser-native paste -> xterm onData -> ptyInput path. */
+  nativePaste(data: string): void;
 }
 
 function simulateWebview(): SimulatedWebview {
   const decisions: TerminalKeyDecision[] = [];
   const writes: string[] = [];
-  return {
+  const posts: TerminalKeyMessage[] = [];
+  const handled: boolean[] = [];
+  const webview: SimulatedWebview = {
     decisions,
     writes,
-    send(event, hasSelection = false) {
+    posts,
+    handled,
+    preventDefaults: 0,
+    send(event, hasSelection = false, selection = '') {
       const decision = decideTerminalKey(event, { hasSelection });
       decisions.push(decision);
-      if (decision.action === 'input') {
-        writes.push(decision.data);
-      }
+      handled.push(
+        applyTerminalKey(event, {
+          hasSelection: () => hasSelection,
+          getSelection: () => selection,
+          input: (data) => writes.push(data),
+          post: (message) => posts.push(message),
+          preventDefault: () => {
+            webview.preventDefaults += 1;
+          },
+        }),
+      );
       return decision;
     },
+    nativePaste(data) {
+      writes.push(data);
+    },
   };
+  return webview;
 }
 
 test('Shift+Enter produces exactly one LF across keydown/keypress/keyup and never CR', () => {
@@ -151,17 +179,24 @@ test('Shift+Enter with Ctrl, Alt or Meta is not translated; Ctrl+J stays native'
   assert.deepEqual(webview.writes, []);
 });
 
-test('Ctrl+C selection and Ctrl+V clipboard decisions keep prior behavior', () => {
+test('Ctrl+C selection copy still posts once and Ctrl+Shift+C stays consumed', () => {
   const webview = simulateWebview();
 
   assert.deepEqual(
-    webview.send({ type: 'keydown', key: 'c', ctrlKey: true }, true),
+    webview.send({ type: 'keydown', key: 'c', ctrlKey: true }, true, 'selected'),
     { action: 'copy' },
   );
+  assert.deepEqual(webview.posts, [
+    { type: 'copyClipboard', text: 'selected' },
+  ]);
+  assert.equal(webview.handled[0], false);
+  assert.equal(webview.preventDefaults, 1);
+
   assert.deepEqual(
     webview.send({ type: 'keydown', key: 'c', ctrlKey: true }, false),
     { action: 'pass' },
   );
+  assert.equal(webview.handled[1], true);
   assert.deepEqual(
     webview.send(
       { type: 'keydown', key: 'C', ctrlKey: true, shiftKey: true },
@@ -169,21 +204,64 @@ test('Ctrl+C selection and Ctrl+V clipboard decisions keep prior behavior', () =
     ),
     { action: 'consume' },
   );
+  assert.equal(webview.handled[2], false);
+  assert.equal(webview.posts.length, 1, 'consume must not copy anything else');
+  assert.deepEqual(webview.writes, []);
+});
+
+test('Ctrl+V and Cmd+V block only raw xterm input and never read the clipboard or write PTY data', () => {
+  for (const event of [
+    { type: 'keydown', key: 'v', ctrlKey: true },
+    { type: 'keydown', key: 'V', ctrlKey: true },
+    { type: 'keydown', key: 'v', metaKey: true },
+    { type: 'keydown', key: 'V', metaKey: true },
+  ] satisfies TerminalKeyEventLike[]) {
+    const webview = simulateWebview();
+
+    assert.deepEqual(webview.send(event, false), { action: 'native-paste' });
+    assert.equal(webview.handled[0], false, 'raw Ctrl+V must be blocked');
+    assert.equal(webview.preventDefaults, 1);
+    assert.deepEqual(webview.posts, [], 'paste must not post readClipboard');
+    assert.deepEqual(webview.writes, [], 'keydown must not write \\x16 or text');
+  }
+});
+
+test('native DOM paste is the single data path and identical consecutive pastes are not deduplicated', () => {
+  const webview = simulateWebview();
+
+  webview.nativePaste('same text');
+  assert.deepEqual(webview.writes, ['same text']);
+
+  webview.nativePaste('same text');
   assert.deepEqual(
-    webview.send({ type: 'keydown', key: 'v', ctrlKey: true }, false),
-    { action: 'paste' },
+    webview.writes,
+    ['same text', 'same text'],
+    'two independent identical pastes must both reach onData',
   );
+  assert.deepEqual(webview.posts, []);
+  assert.equal(webview.preventDefaults, 0);
+});
+
+test('Ctrl+Shift+V, keypress and keyup keep their pass-through semantics without paste side effects', () => {
+  const webview = simulateWebview();
+
   assert.deepEqual(
     webview.send({ type: 'keydown', key: 'V', ctrlKey: true, shiftKey: true }),
     { action: 'pass' },
   );
-
-  // Non-keydown events must not re-run copy/paste decisions.
   assert.deepEqual(
     webview.send({ type: 'keypress', key: 'v', ctrlKey: true }, false),
     { action: 'pass' },
   );
-  assert.deepEqual(webview.writes, []);
+  assert.deepEqual(
+    webview.send({ type: 'keyup', key: 'v', ctrlKey: true }, false),
+    { action: 'pass' },
+  );
+
+  assert.deepEqual(webview.handled, [true, true, true]);
+  assert.equal(webview.preventDefaults, 0);
+  assert.deepEqual(webview.posts, []);
+  assert.deepEqual(webview.writes, [], 'keypress/keyup must not duplicate a paste');
 });
 
 test('fit gate rejects zero-sized and hidden wrappers', () => {

@@ -484,4 +484,9 @@ test('parseWebviewMessage validates PTY input, resize, attach and clipboard mess
   );
   assert.equal(parseWebviewMessage({ type: 'copyClipboard', text: 'x' }).ok, true);
   assert.equal(parseWebviewMessage({ type: 'copyClipboard', text: 1 }).ok, false);
+  assert.equal(
+    parseWebviewMessage({ type: 'readClipboard' }).ok,
+    false,
+    'the old host-side clipboard read protocol must stay removed',
+  );
 });

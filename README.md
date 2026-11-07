@@ -1,14 +1,21 @@
 # OpenCode Terminal for VS Code
 
-在 VS Code **Secondary Sidebar（辅助侧边栏，默认位于窗口右侧）**中直接运行 **OpenCode 的真实 TUI**。同一个 `opencodeTerminalSecondary` 容器中，上方是 xterm/OpenCode webview 主区域，下方紧邻一个小型原生 **“拖入文件”** TreeView：把 Explorer 中选中的多个文件拖到该原生区域，0.0.8 会始终以纯文本 `@路径` 插入**整文件**引用；只有多行编辑器选区才通过 OpenCode 内部 editor WebSocket 结构化插入，单行选区回退为 `@路径#行-行`。所有情况都**不会按回车/Tab，也不会执行任意拖入文本**，引用需在 OpenCode 中手动确认。
+在 VS Code **Secondary Sidebar（辅助侧边栏，默认位于窗口右侧）**中直接运行 **OpenCode 的真实 TUI**。同一个 `opencodeTerminalSecondary` 容器中，上方是 xterm/OpenCode webview 主区域，下方紧邻一个小型原生 **“拖入文件”** TreeView：把 Explorer 中选中的多个文件拖到该原生区域，0.0.9 会始终以纯文本 `@路径` 插入**整文件**引用；只有多行编辑器选区才通过 OpenCode 内部 editor WebSocket 结构化插入，单行选区回退为 `@路径#行-行`。所有情况都**不会按回车/Tab，也不会执行任意拖入文本**，引用需在 OpenCode 中手动确认。
 
 仓库：[zhangyahan/vscode-opencode-terminal](https://github.com/zhangyahan/vscode-opencode-terminal)。发布配置使用 VS Code Marketplace Publisher `zhangyahan`，扩展 ID 为 `zhangyahan.vscode-opencode-terminal`；Marketplace 条目生效前，请使用下方 VSIX 安装。
+
+## 0.0.9 的变化
+
+- **粘贴改为单一路径，修复 Ctrl+V 双份**：keydown 中的 Ctrl/Cmd+V 仍会被拦截，避免 xterm 把原始 `\x16` 控制字节写入 PTY；但扩展不再主动发送 `readClipboard`、extension host 不再读取剪贴板，也不再向 webview 回发 `pasteText`。粘贴文本只由 VS Code webview/xterm 的原生 DOM paste 事件经 `terminal.onData` 写入一次。
+- 不做按时间窗或文本内容的去重：连续两次粘贴相同内容会得到两次写入，这是独立粘贴的正常语义。Ctrl+Shift+V 的既有放行语义不变；Cmd+V 与 Ctrl+V 走同一条拦截路径。复制（Ctrl+C 选区、`copyClipboard`）与右键原生粘贴、拖放行为不变。
+- 移除 `readClipboard`/`pasteText` 死协议；旧 webview 发来的 `readClipboard` 会被拒绝，绝不读取剪贴板或回发粘贴内容。
+- 版本 `0.0.9`。升级后请 **完整 Reload Window** 让新的 webview 脚本生效。粘贴修复的自动化测试是行为级模拟，**不能替代真实 VS Code host 中的 Ctrl+V/Cmd+V、右键粘贴和 IME 验证**。
 
 ## 0.0.8 的变化
 
 - **两个视图保持原生折叠**：上方 TUI webview 与下方“拖入文件”TreeView 仍是同一 `opencodeTerminalSecondary` 容器中的两个原生视图。点击各自视图标题的折叠/展开控件，或使用 VS Code 视图标题菜单中的折叠操作即可；扩展不注入自定义折叠按钮，也不修改 90/10 初始布局和视图引用。
 - **Shift+Enter 专门换行**：仅当 `Shift+Enter` 且没有 Ctrl/Alt/Meta、也不处于 IME 组合输入时，webview 才发送 OpenCode 默认换行绑定 **Ctrl+J** 的裸 LF `\n`（不是 CR），经 xterm 唯一的 `onData` 路径写入 PTY，因此不会提交；同时阻止该 keydown 的默认行为，并对后续 keypress 只阻断、不重复发送。普通 Enter 仍由 xterm 发送 CR 提交；Ctrl+J 原有换行不变，其他修饰键组合不主动扩展。若用户在 OpenCode `cli.json` 中把换行键重新绑定到别的键，Shift+Enter 映射到 Ctrl+J 的默认假设可能不再适用；本扩展不会修改用户的 `cli.json`。
-- **IME 安全边界**：`event.isComposing`、keyCode `229` 或 key `Process` 的自定义按键处理最高优先级直接放行，中文/日文选词时按 Enter 不会被本扩展当成换行或提交吞掉。Ctrl+C/Ctrl+V 的选区复制、无选区中断和剪贴板粘贴语义保持不变。
+- **IME 安全边界**：`event.isComposing`、keyCode `229` 或 key `Process` 的自定义按键处理最高优先级直接放行，中文/日文选词时按 Enter 不会被本扩展当成换行或提交吞掉。Ctrl+C/Ctrl+V 的选区复制、无选区中断和剪贴板粘贴语义在 0.0.8 保持不变；0.0.9 起 Ctrl+V 改为原生 paste 单一路径，详见上节。
 - **侧栏尺寸 trailing 防抖 175ms**：ResizeObserver、窗口 resize、字体/主题变化只重置计时器，用户停止拖动 175ms 后才执行一次 FitAddon 和 PTY resize（SIGWINCH），不再逐帧 rAF fit。初始 `ready` 与 snapshot attach 仍即时 fit 以保证首屏正确；容器隐藏或 `terminalWrap.clientWidth/clientHeight` 为 0 时跳过 fit，避免 FitAddon 把终端 clamp 成 2x1。防抖期间 xterm 可能按旧尺寸暂时裁切输出；这里的限制只针对 fit/PTY 尺寸通知，不承诺 TUI 输出在拖动中完全冻结。
 - 版本 `0.0.8`。升级后请 **完整 Reload Window** 让新的 webview 脚本生效。
 
@@ -20,7 +27,7 @@
 - 升级到 0.0.7 需要 **完整 Reload Window**。扩展不写 VS Code storage 布局，也不重置全部视图；如果曾手动移动/固定过这些视图，可能需要在视图标题菜单选择 **Reset Location** 才会回到新的辅助侧边栏容器。
 - 版本要求提升到 VS Code `^1.106.0`（`secondarySidebar` contribution 自 1.106 起可用）。
 
-> 以下 0.0.7 及更早章节是历史变更记录；其中的“底部面板”“原生区域在上”等只描述当时版本。0.0.8 的当前行为以上节和“功能”章节为准。
+> 以下 0.0.8 及更早章节是历史变更记录；其中的“底部面板”“原生区域在上”等只描述当时版本。0.0.9 的当前行为以 0.0.9 章节和“功能”章节为准。
 
 ## 0.0.6 的变化
 
@@ -68,16 +75,16 @@
   - 多行编辑器选区：结构化桥接时发送 1-based 行区间；否则文本回退 `@src/core.ts#12-20`。
   - 单行选区：始终文本回退 `@src/core.ts#12-12`，避免 TUI 把单行范围扩展到文件尾；提示需手动确认。
   - 纯文本只有在 5 分钟选区缓存中**精确且唯一**匹配时才生成行号；无匹配时提示使用右键“添加当前选区”，不会把任意文本执行到终端。
-- 支持 Ctrl+C 复制 xterm 选区（有选区时不向 PTY 发送 Ctrl+C；无选区时 Ctrl+C 仍作为终端中断发送），Ctrl+V 通过扩展读取剪贴板后交给 xterm 粘贴。
+- 支持 Ctrl+C 复制 xterm 选区（有选区时不向 PTY 发送 Ctrl+C；无选区时 Ctrl+C 仍作为终端中断发送）。Ctrl+V/Cmd+V 只拦截 xterm 原始 `\x16`，不再读取宿主剪贴板；粘贴文本由 VS Code webview 的原生 DOM paste 经 `terminal.onData` 写入 PTY 一次。连续相同内容粘贴两次会写入两次，不做去重；右键原生粘贴和拖放保持原样。
 - 支持 Shift+Enter 换行：映射为 OpenCode 默认 Ctrl+J 的裸 LF，不发送 CR、不提交；普通 Enter 仍提交。IME 组合输入期间（`isComposing`/keyCode 229/key `Process`）本扩展的按键处理全部放行，不会吞掉选词回车。
 - 有限输出缓冲（约 200 KB）。超过时 webview 会提示较早的输出已截断；这是屏幕恢复缓冲，不是无损日志。
 
 ## 环境要求
 
 - VS Code `^1.106.0`（`secondarySidebar` contribution 的最低版本）。
-- **Windows x64**：0.0.8 的已构建 VSIX 只声明并验证了 `win32-x64`。其他平台的理论依赖已由上游提供，但本版本没有验证，也不会声称支持。
+- **Windows x64**：0.0.9 的已构建 VSIX 只声明并验证了 `win32-x64`。其他平台的理论依赖已由上游提供，但本版本没有验证，也不会声称支持。
 - 本地已安装 OpenCode CLI，并且在 VS Code 默认终端环境中能执行 `opencode`。
-- 工作区必须处于 **Workspace Trust**。限制模式下扩展不会 spawn PTY、读取剪贴板或向终端写入任何内容。
+- 工作区必须处于 **Workspace Trust**。限制模式下扩展不会 spawn PTY 或向终端写入任何内容。
 
 ## 安装
 
@@ -87,15 +94,15 @@ Marketplace 扩展 ID：`zhangyahan.vscode-opencode-terminal`（`win32-x64`，VS
 code --install-extension zhangyahan.vscode-opencode-terminal
 ```
 
-Marketplace 条目生效前，或需要离线安装当前 0.0.8 构建时：
+Marketplace 条目生效前，或需要离线安装当前 0.0.9 构建时：
 
 ```powershell
-code --install-extension vscode-opencode-terminal-0.0.8-win32-x64.vsix
+code --install-extension vscode-opencode-terminal-0.0.9-win32-x64.vsix
 ```
 
 Marketplace：[zhangyahan.vscode-opencode-terminal](https://marketplace.visualstudio.com/items?itemName=zhangyahan.vscode-opencode-terminal)。此前通过本地 `publisher: local` 构建的 VSIX 安装用户，Marketplace 版本会使用新的扩展 ID `zhangyahan.vscode-opencode-terminal`；安装后不会自动替换或卸载旧的 `local.vscode-opencode-terminal` 条目，请自行确认并卸载旧条目。本扩展不会自动卸载任何扩展。
 
-安装或升级后请 **完整 Reload Window**。0.0.8 不再贡献旧 `viewsContainers.panel` 容器；如果曾手动移动/固定过 OpenCode 视图，可能需要在视图标题菜单选择 **Reset Location**。扩展不会写入 VS Code storage 布局，也不会重置全部视图。
+安装或升级后请 **完整 Reload Window**。当前版本不再贡献旧 `viewsContainers.panel` 容器；如果曾手动移动/固定过 OpenCode 视图，可能需要在视图标题菜单选择 **Reset Location**。扩展不会写入 VS Code storage 布局，也不会重置全部视图。
 
 VSIX 内含 `@lydell/node-pty` 的 N-API 预编译产物，以及桥接使用的锁定版本 `ws` 运行依赖；安装扩展不需要 Visual Studio Build Tools、node-gyp 或全局编译器。
 
@@ -149,7 +156,7 @@ VSIX 内含 `@lydell/node-pty` 的 N-API 预编译产物，以及桥接使用的
 
 ## 安全设计
 
-- Workspace Trust 未启用时绝不 spawn PTY、读取剪贴板或写入。
+- Workspace Trust 未启用时绝不 spawn PTY 或写入。扩展也不主动读取宿主剪贴板（复制仅使用 xterm 选区文本写入剪贴板）。
 - Webview CSP：`default-src 'none'`，脚本只允许 nonce 外部文件，不使用 CDN；xterm 需要内联 style，因此仅对 `style-src`/`style-src-attr` 显式开放 `'unsafe-inline'`，没有放开脚本内联。
 - 所有 webview 消息都做类型、长度、会话 ID、尺寸边界校验；PTY 写入同时校验工作区 key 和 sessionId，跨工作区/过期会话不能写入。
 - 输出使用带 sequence 的 snapshot + 增量 batch 协议；webview 按 sequence 去重，发现缺口会重新请求 snapshot，避免静默丢输出。
@@ -179,10 +186,10 @@ VSIX 内含 `@lydell/node-pty` 的 N-API 预编译产物，以及桥接使用的
 
 ## 版本与平台
 
-- 版本：`0.0.8`
+- 版本：`0.0.9`
 - 扩展 ID：`zhangyahan.vscode-opencode-terminal`
 - 目标平台：`win32-x64`（最低 VS Code `^1.106.0`）
-- VSIX：`vscode-opencode-terminal-0.0.8-win32-x64.vsix`
+- VSIX：`vscode-opencode-terminal-0.0.9-win32-x64.vsix`
 
 ## 开发与测试
 
@@ -203,11 +210,11 @@ npm run package      # 生成 win32-x64 VSIX
 - `editorBridge`：真实 `ws` 客户端完成 `initialize -> notifications/initialized -> at_mentioned`；断开、未握手、Origin、非 opencode 初始化、替换旧连接、stop 清理均不得发送。
 - `ptySession` / `shellProfile`：会话生命周期、输入/尺寸边界、输出 sequence/backlog、dispose；VS Code terminal profile 解析、环境合并、错误回退。
 - `ptyAdapter.integration`：真实加载随包安装的 N-API 预编译 node-pty，运行一个短命令 `echo PTY_NATIVE_OK`，不启动 OpenCode。该文件沿用 `--test-force-exit` 仅用于关闭 node-pty 的 native handle；新增 bridge 测试不依赖它。
-- `webviewInteraction`：行为级模拟 keydown/keypress/keyup、IME、普通 Enter 与 Ctrl+C/Ctrl+V，断言一次 Shift+Enter 只产生一个 LF 且绝不产生 CR；用注入的 fake scheduler 验证 100 次连续 resize 只触发一次 trailing fit、初始/快照 fitNow 即时执行、取消/隐藏/零尺寸不 fit、恢复后重新 fit。测试不加载 xterm 真实 DOM。
-- `extension.integration`：mock VS Code 下验证自动 spawn 一次、profile args/env/cwd、bridge 端口 env 覆盖、ready/attach 实际尺寸与已运行 PTY resize、输入/输出/退出、多行选区走结构化桥接、整文件仅写 `@path` 且不打开文档/不调用 bridge、单行与断开时仅文本无 Enter、bridge 启动失败清理、PTY 退出/移除工作区/dispose 关闭 bridge、untrusted 不启动 bridge、CodeEditors options.selection、工作区配置确认、拒绝工作区配置时不用 workspace 解析的 `vscode.env.shell`；另用 mock 原生 TreeView/DataTransfer 验证多文件整文件仅 `@路径` 不含 `#`、`CodeFiles` 原生路径、`asFile()?.uri`、目录跳过、非法 MIME、无 PTY、untrusted 与异步 `asString` 失败均不误写。
-- `manifest`：契约检查只贡献 `secondarySidebar` 且无 `panel`、TUI/drop 视图顺序与 90/10 `initialSize`、旧 view/命令 ID 保留、VS Code 最低版本 `^1.106.0`、0.0.8 VSIX 文件名，以及 Marketplace publisher/安装 ID 为 `zhangyahan.vscode-opencode-terminal`。
+- `webviewInteraction`：行为级模拟 keydown/keypress/keyup、IME、普通 Enter 与 Ctrl+C/Ctrl+V；注入 post/input/selection 副作用，断言 Ctrl+V/Cmd+V keydown 只阻止原始 `\x16`，不读取剪贴板、不写 PTY；模拟原生 paste 一次只产生一次 onData，两次相同 paste 产生两次且无去重；Ctrl+Shift+V、keypress/keyup 不产生额外粘贴。另用注入的 fake scheduler 验证 100 次连续 resize 只触发一次 trailing fit、初始/快照 fitNow 即时执行、取消/隐藏/零尺寸不 fit、恢复后重新 fit。测试不加载 xterm 真实 DOM。
+- `extension.integration`：mock VS Code 下验证自动 spawn 一次、profile args/env/cwd、bridge 端口 env 覆盖、ready/attach 实际尺寸与已运行 PTY resize、输入/输出/退出、多行选区走结构化桥接、整文件仅写 `@path` 且不打开文档/不调用 bridge、单行与断开时仅文本无 Enter、bridge 启动失败清理、PTY 退出/移除工作区/dispose 关闭 bridge、untrusted 不启动 bridge、CodeEditors options.selection、工作区配置确认、拒绝工作区配置时不用 workspace 解析的 `vscode.env.shell`；旧 `readClipboard` 消息被拒绝且不读取剪贴板、不回发 `pasteText`；另用 mock 原生 TreeView/DataTransfer 验证多文件整文件仅 `@路径` 不含 `#`、`CodeFiles` 原生路径、`asFile()?.uri`、目录跳过、非法 MIME、无 PTY、untrusted 与异步 `asString` 失败均不误写。
+- `manifest`：契约检查只贡献 `secondarySidebar` 且无 `panel`、TUI/drop 视图顺序与 90/10 `initialSize`、旧 view/命令 ID 保留、VS Code 最低版本 `^1.106.0`、0.0.9 VSIX 文件名，以及 Marketplace publisher/安装 ID 为 `zhangyahan.vscode-opencode-terminal`。
 
-当前测试数：**129 个通过**（`npm test`，不含单独运行的 1 个 node-pty native smoke）。这些 bridge 测试使用真实 WebSocket 客户端，但仍是协议级 mock，不等于已证明真实 OpenCode TUI 插入成功；`webviewInteraction` 也不等于真实浏览器 IME/拖动 UI 验证。
+当前测试数：**133 个通过**（`npm test`，不含单独运行的 1 个 node-pty native smoke）。这些 bridge 测试使用真实 WebSocket 客户端，但仍是协议级 mock，不等于已证明真实 OpenCode TUI 插入成功；`webviewInteraction` 也不等于真实浏览器 IME、剪贴板或拖动 UI 验证。
 
 ### 原生加载证据与限制
 
@@ -217,7 +224,7 @@ npm run package      # 生成 win32-x64 VSIX
 
 ### 手工测试清单
 
-1. 安装/加载 0.0.8 后 **完整 Reload Window**，打开单根工作区，确认 OpenCode 出现在 Secondary Sidebar（通常为右侧），TUI 在上、下方紧邻小型“拖入文件”原生区域。若视图仍停留在旧位置，使用视图标题菜单的 **Reset Location**。
+1. 安装/加载 0.0.9 后 **完整 Reload Window**，打开单根工作区，确认 OpenCode 出现在 Secondary Sidebar（通常为右侧），TUI 在上、下方紧邻小型“拖入文件”原生区域。若视图仍停留在旧位置，使用视图标题菜单的 **Reset Location**。
 2. 确认自动执行 `opencode` 一次；再次打开侧栏不重复 spawn。
 3. 分别点击 TUI 上方视图标题和“拖入文件”视图标题的折叠控件，确认两个视图可独立折叠/展开，且展开后内容仍在；扩展不会新增折叠按钮或改变分隔线布局。
 4. 在 TUI 输入框执行 `Shift+Enter`，确认只换行不提交；普通 `Enter` 提交；`Ctrl+J` 仍换行。使用中文输入法选词时按 `Enter`，确认选词正常、不会被吞掉或误提交。
@@ -225,16 +232,17 @@ npm run package      # 生成 win32-x64 VSIX
 6. 如果 Explorer 内部拖拽无法进入 xterm webview，确认扩展给出平台限制提示，而不是宣称 webview 直接拖放一定可用。
 7. 在编辑器选中多行/单行后拖入或使用右键“添加当前选区”：多行在 bridge 可用时结构化插入；单行始终回退为文本 `@文件#行-行` 并提示需手动确认；整文件（右键“添加文件”或命令面板“选择文件插入 @ 引用”）始终为纯文本 `@文件`；无匹配纯文本只提示，不写入。
 8. 有选区时 Ctrl+C 复制，不向 PTY 发 Ctrl+C；无选区时 Ctrl+C 照常中断。
-9. Ctrl+V 粘贴剪贴板内容，不自动回车。
-10. 连续拖动侧栏边缘改变宽度约 2 秒后停手，确认只在停止约 175ms 后发生一次终端重排/PTY resize，而不是拖动过程中每帧重排；首屏仍按真实尺寸显示，隐藏侧栏再打开不应出现 2x1 clamp。拖动过程中输出按旧尺寸临时裁切属已知现象。
-11. 关闭/隐藏再打开侧栏，确认内容通过 snapshot 恢复；重启扩展宿主后确认旧 PTY 结束且没有孤儿进程。
-12. 在设置中修改默认 shell 或 profile，确认出现“重启 PTY 后生效”提示。
-13. 在工作区 `.vscode/settings.json` 写 `terminal.integrated.env.windows`，确认首次启动出现工作区配置确认；选择“仅使用用户配置”后不注入该 env，并确认没有使用工作区 profile 解析出的 `vscode.env.shell`。
-14. 用户默认 profile 只有 `source`、没有 `path` 时选择“仅使用用户配置”，确认明确报错要求补充用户 profile `path`，而不是启动可疑路径。
-15. 未启动 PTY 时直接从原生区域拖入文件，确认只提示先启动/重启，不写入。
-16. 从系统文件管理器拖文件到原生区域，确认没有 `asFile()?.uri` 时只提示，不猜测路径。
-17. 在多根工作区移除当前活动文件夹，确认对应 PTY 被 kill、xterm 缓冲清空，且没有孤儿进程。
-18. 打开不受信任工作区，确认不会 spawn、不会写入，侧栏仍可见。
-19. 拖动两个视图之间的分隔线，确认原生区域可以缩小，TUI 主区域保持可用。
-20. 启动 PTY 后，整文件引用应直接写纯文本 `@路径` 并提示需手动确认；多行选区在 OpenCode 支持内部 editor 协议时显示“已发送引用添加请求（未提交）”。两种情况都没有自动 Enter/Tab。
-21. 检查状态提示没有声称“TUI 已确认插入”；断开桥接或停止 PTY 后再次添加引用，确认不会向旧 session/旧 bridge 发送。
+9. 在真实 VS Code 中分别验证 Ctrl+V（Windows/Linux）与 Cmd+V（macOS）：每次只粘贴一份，不出现原始 `^V` 控制字符，也不自动回车；连续两次粘贴相同内容应得到两份。再用右键菜单原生粘贴一次，确认同样只粘贴一份；拖放行为保持不变。自动化测试只覆盖注入式 keydown/onData 行为，**本轮没有在真实 VS Code host 中执行这些手工步骤**。
+10. 在真实 VS Code 中使用中文/日文 IME 选词并按 Enter，确认候选确认正常；IME 行为仍需实际 VS Code + 浏览器层验证，不能由 Node 测试替代。
+11. 连续拖动侧栏边缘改变宽度约 2 秒后停手，确认只在停止约 175ms 后发生一次终端重排/PTY resize，而不是拖动过程中每帧重排；首屏仍按真实尺寸显示，隐藏侧栏再打开不应出现 2x1 clamp。拖动过程中输出按旧尺寸临时裁切属已知现象。
+12. 关闭/隐藏再打开侧栏，确认内容通过 snapshot 恢复；重启扩展宿主后确认旧 PTY 结束且没有孤儿进程。
+13. 在设置中修改默认 shell 或 profile，确认出现“重启 PTY 后生效”提示。
+14. 在工作区 `.vscode/settings.json` 写 `terminal.integrated.env.windows`，确认首次启动出现工作区配置确认；选择“仅使用用户配置”后不注入该 env，并确认没有使用工作区 profile 解析出的 `vscode.env.shell`。
+15. 用户默认 profile 只有 `source`、没有 `path` 时选择“仅使用用户配置”，确认明确报错要求补充用户 profile `path`，而不是启动可疑路径。
+16. 未启动 PTY 时直接从原生区域拖入文件，确认只提示先启动/重启，不写入。
+17. 从系统文件管理器拖文件到原生区域，确认没有 `asFile()?.uri` 时只提示，不猜测路径。
+18. 在多根工作区移除当前活动文件夹，确认对应 PTY 被 kill、xterm 缓冲清空，且没有孤儿进程。
+19. 打开不受信任工作区，确认不会 spawn、不会写入，侧栏仍可见。
+20. 拖动两个视图之间的分隔线，确认原生区域可以缩小，TUI 主区域保持可用。
+21. 启动 PTY 后，整文件引用应直接写纯文本 `@路径` 并提示需手动确认；多行选区在 OpenCode 支持内部 editor 协议时显示“已发送引用添加请求（未提交）”。两种情况都没有自动 Enter/Tab。
+22. 检查状态提示没有声称“TUI 已确认插入”；断开桥接或停止 PTY 后再次添加引用，确认不会向旧 session/旧 bridge 发送。

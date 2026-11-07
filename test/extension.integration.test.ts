@@ -238,7 +238,7 @@ interface Harness {
   readonly treeViews: MockTreeViewRegistration[];
   readonly outputLines: string[];
   readonly openDocuments: MockUri[];
-  readonly clipboard: { value: string };
+  readonly clipboard: { value: string; reads: number };
   setActiveEditor(editor: unknown): void;
   resolveView(): { readonly html: string };
   sendMessage(message: unknown): void;
@@ -276,7 +276,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
   const treeViews: MockTreeViewRegistration[] = [];
   const outputLines: string[] = [];
   const openDocuments: MockUri[] = [];
-  const clipboard = { value: '' };
+  const clipboard = { value: '', reads: 0 };
   const folderChangeListeners = new Set<(event: unknown) => void>();
   let folders = [folder];
   let nextSession = 0;
@@ -467,7 +467,10 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     env: {
       shell: options.envShell ?? 'C:/Program Files/PowerShell/7/pwsh.exe',
       clipboard: {
-        readText: async () => clipboard.value,
+        readText: async () => {
+          clipboard.reads += 1;
+          return clipboard.value;
+        },
         writeText: async (value: string) => {
           clipboard.value = value;
         },
@@ -731,6 +734,51 @@ test('auto-start spawns once with profile args/env/cwd, streams output, input, r
       process.env.ELECTRON_RUN_AS_NODE = previousElectron;
     }
   }
+});
+
+test('legacy readClipboard messages are rejected without reading or reposting the clipboard', async () => {
+  const harness = makeHarness();
+  harness.resolveView();
+  harness.sendMessage({ type: 'ready' });
+  await harness.waitFor(() => harness.spawnCalls.length === 1, 'PTY spawn');
+  await harness.waitFor(
+    () => harness.postedOfType('ptySnapshot').length > 0,
+    'snapshot',
+  );
+
+  const writesBefore = [...harness.processes[0].writes];
+  harness.clipboard.value = 'SENTINEL_PASTE';
+  harness.clipboard.reads = 0;
+  const postedBefore = harness.posted.length;
+
+  harness.sendMessage({ type: 'readClipboard' });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  assert.equal(
+    harness.clipboard.reads,
+    0,
+    'the removed readClipboard protocol must never touch the host clipboard',
+  );
+  assert.equal(
+    harness.postedOfType('pasteText').length,
+    0,
+    'the host must never replay pasteText to the webview',
+  );
+  assert.deepEqual(
+    harness.processes[0].writes,
+    writesBefore,
+    'rejecting the legacy message must not write to the PTY',
+  );
+  assert.equal(
+    harness.posted.length,
+    postedBefore + 1,
+    'only the error state notice is posted',
+  );
+  const state = harness.postedOfType('state').at(-1) as {
+    notice?: { kind?: string; message?: string };
+  };
+  assert.equal(state.notice?.kind, 'error');
+  assert.match(String(state.notice?.message), /已忽略无效的 webview 消息/);
 });
 
 test('drop writes @mentions without Enter and never executes arbitrary plain text', async () => {

@@ -485,9 +485,6 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
         case 'clear':
           this.clearTerminal();
           return;
-        case 'readClipboard':
-          await this.pasteClipboard();
-          return;
         case 'copyClipboard':
           await this.copyText(parsed.message.text);
           return;
@@ -1327,28 +1324,6 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
       message: `${parts.join('；')}。`,
     };
     this.postState();
-  }
-
-  private async pasteClipboard(): Promise<void> {
-    if (!vscode.workspace.isTrusted) {
-      this.reportError('当前工作区处于限制模式，已禁止粘贴到 PTY。');
-      return;
-    }
-    let text: string;
-    try {
-      text = await vscode.env.clipboard.readText();
-    } catch (error) {
-      this.reportError(`无法读取剪贴板：${toErrorMessage(error)}`);
-      return;
-    }
-    if (text.length === 0) {
-      return;
-    }
-    if (text.length > MAX_CLIPBOARD_TEXT_LENGTH) {
-      this.reportError('剪贴板内容过长，未粘贴。');
-      return;
-    }
-    this.postMessage({ type: 'pasteText', text });
   }
 
   private async copyText(

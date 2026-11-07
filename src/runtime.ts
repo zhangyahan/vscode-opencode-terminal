@@ -60,7 +60,6 @@ export type WebviewInboundMessage =
   | { readonly type: 'pickFiles' }
   | { readonly type: 'addActiveSelection' }
   | { readonly type: 'clear' }
-  | { readonly type: 'readClipboard' }
   | { readonly type: 'copyClipboard'; readonly text: string }
   | {
       readonly type: 'ptyInput';
@@ -157,7 +156,6 @@ export function parseWebviewMessage(raw: unknown): WebviewMessageResult {
     case 'pickFiles':
     case 'addActiveSelection':
     case 'clear':
-    case 'readClipboard':
       return { ok: true, message: { type } };
 
     case 'ready':

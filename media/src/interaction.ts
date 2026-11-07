@@ -27,10 +27,27 @@ export type TerminalKeyDecision =
   | { readonly action: 'consume' }
   | { readonly action: 'input'; readonly data: string }
   | { readonly action: 'copy' }
-  | { readonly action: 'paste' };
+  | { readonly action: 'native-paste' };
 
 export interface TerminalKeyOptions {
   readonly hasSelection: boolean;
+}
+
+export type TerminalKeyMessage = {
+  readonly type: 'copyClipboard';
+  readonly text: string;
+};
+
+/**
+ * Browser-side effects injected by the webview. Tests use the same helper with
+ * recording fakes, so key handling and its side effects cannot drift apart.
+ */
+export interface TerminalKeyEffects {
+  readonly hasSelection: () => boolean;
+  readonly getSelection: () => string;
+  readonly input: (data: string) => void;
+  readonly post: (message: TerminalKeyMessage) => void;
+  readonly preventDefault: () => void;
 }
 
 /**
@@ -64,7 +81,10 @@ function isEnter(event: TerminalKeyEventLike): boolean {
  * - Shift+Enter (without Ctrl/Alt/Meta) is the only binding we translate: the
  *   caller sends exactly one LF through `terminal.input('\n')`.
  * - Plain Enter and every other key pass through so xterm can send CR,
- *   Ctrl+C/Ctrl+V keep their previous selection/clipboard semantics.
+ *   Ctrl+C keeps its selection-copy semantics.
+ * - Ctrl/Cmd+V is blocked from xterm's raw Ctrl+V (`\x16`) path, but never
+ *   reads the clipboard from the extension host. The browser's native paste
+ *   event remains the single owner and delivers data through `terminal.onData`.
  * - `keypress` for Shift+Enter is consumed as well, but never produces a
  *   second LF, so a browser that still emits it cannot duplicate the newline.
  */
@@ -108,10 +128,54 @@ export function decideTerminalKey(
   }
 
   if (key === 'v' && event.shiftKey !== true) {
-    return { action: 'paste' };
+    return { action: 'native-paste' };
   }
 
   return { action: 'pass' };
+}
+
+/**
+ * Apply a key decision to the webview without touching the clipboard.
+ *
+ * Ctrl/Cmd+V returns `false` so xterm does not emit its raw `\x16` control
+ * byte; the browser-native paste event is left to deliver the text exactly
+ * once through xterm's `onData`. No message is posted for paste, so the host
+ * can never read the clipboard or replay a second `pasteText`.
+ */
+export function applyTerminalKey(
+  event: TerminalKeyEventLike,
+  effects: TerminalKeyEffects,
+): boolean {
+  const decision = decideTerminalKey(event, {
+    hasSelection: effects.hasSelection(),
+  });
+
+  switch (decision.action) {
+    case 'pass':
+      return true;
+    case 'consume':
+      effects.preventDefault();
+      return false;
+    case 'input':
+      // Shift+Enter is translated to OpenCode's default Ctrl+J newline (LF).
+      // onData remains the single path to the PTY, so no double post occurs.
+      effects.preventDefault();
+      effects.input(decision.data);
+      return false;
+    case 'copy': {
+      const selection = effects.getSelection();
+      if (selection.length > 0) {
+        effects.post({ type: 'copyClipboard', text: selection });
+      }
+      effects.preventDefault();
+      return false;
+    }
+    case 'native-paste':
+      // Block only xterm's raw Ctrl+V path. Do not read the clipboard here:
+      // the VSCode webview's native DOM paste event remains the single owner.
+      effects.preventDefault();
+      return false;
+  }
 }
 
 export interface TimerScheduler {

@@ -11,7 +11,7 @@ import { Terminal } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import {
   TerminalFitDebouncer,
-  decideTerminalKey,
+  applyTerminalKey,
 } from './interaction';
 import './webview.css';
 
@@ -227,39 +227,15 @@ terminal.onData((data) => {
   }
 });
 
-terminal.attachCustomKeyEventHandler((event) => {
-  const decision = decideTerminalKey(event, {
-    hasSelection: terminal.hasSelection(),
-  });
-
-  switch (decision.action) {
-    case 'pass':
-      return true;
-    case 'consume':
-      event.preventDefault();
-      return false;
-    case 'input':
-      // Shift+Enter is translated to OpenCode's default Ctrl+J newline (LF).
-      // onData remains the single path to the PTY, so no double post occurs.
-      event.preventDefault();
-      terminal.input(decision.data);
-      return false;
-    case 'copy': {
-      const selection = terminal.getSelection();
-      if (selection.length > 0) {
-        post({ type: 'copyClipboard', text: selection });
-      }
-      event.preventDefault();
-      return false;
-    }
-    case 'paste':
-      event.preventDefault();
-      post({ type: 'readClipboard' });
-      return false;
-    default:
-      return true;
-  }
-});
+terminal.attachCustomKeyEventHandler((event) =>
+  applyTerminalKey(event, {
+    hasSelection: () => terminal.hasSelection(),
+    getSelection: () => terminal.getSelection(),
+    input: (data) => terminal.input(data),
+    post,
+    preventDefault: () => event.preventDefault(),
+  }),
+);
 
 function requestAttach(): void {
   if (resyncPending) {
@@ -465,14 +441,6 @@ window.addEventListener('message', (event) => {
           'error',
           0,
         );
-      }
-      return;
-    }
-    case 'pasteText': {
-      const value = (message as { text?: unknown }).text;
-      if (typeof value === 'string' && value.length > 0) {
-        terminal.paste(value);
-        terminal.focus();
       }
       return;
     }

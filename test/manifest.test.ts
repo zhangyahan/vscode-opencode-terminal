@@ -141,16 +141,16 @@ test('manifest requires VS Code 1.106 or newer for secondarySidebar', () => {
   assert.equal(manifest.devDependencies?.['@types/vscode'], '1.106.0');
 });
 
-test('version and packaging target 0.0.8 consistently', () => {
-  assert.equal(manifest.version, '0.0.8');
+test('version and packaging target 0.0.9 consistently', () => {
+  assert.equal(manifest.version, '0.0.9');
   assert.match(manifest.description, /Secondary Sidebar/);
-  assert.equal(lockfile.version, '0.0.8');
-  assert.equal(lockfile.packages['']?.version, '0.0.8');
+  assert.equal(lockfile.version, '0.0.9');
+  assert.equal(lockfile.packages['']?.version, '0.0.9');
   assert.equal(lockfile.packages['']?.engines?.vscode, '^1.106.0');
 
   const packageScript = manifest.scripts?.package ?? '';
-  assert.match(packageScript, /vscode-opencode-terminal-0\.0\.8-win32-x64\.vsix/);
-  assert.doesNotMatch(packageScript, /0\.0\.7/);
+  assert.match(packageScript, /vscode-opencode-terminal-0\.0\.9-win32-x64\.vsix/);
+  assert.doesNotMatch(packageScript, /0\.0\.8/);
 });
 
 test('marketplace publisher and installation ID target zhangyahan', () => {
