@@ -18,6 +18,7 @@ interface ViewContribution {
 
 interface Manifest {
   readonly version: string;
+  readonly publisher: string;
   readonly description: string;
   readonly engines: {
     readonly vscode: string;
@@ -150,4 +151,16 @@ test('version and packaging target 0.0.8 consistently', () => {
   const packageScript = manifest.scripts?.package ?? '';
   assert.match(packageScript, /vscode-opencode-terminal-0\.0\.8-win32-x64\.vsix/);
   assert.doesNotMatch(packageScript, /0\.0\.7/);
+});
+
+test('marketplace publisher and installation ID target zhangyahan', () => {
+  assert.equal(manifest.publisher, 'zhangyahan');
+
+  const readme = readFileSync(resolvePath(projectRoot, 'README.md'), 'utf8');
+  assert.match(readme, /zhangyahan\.vscode-opencode-terminal/);
+  assert.match(
+    readme,
+    /marketplace\.visualstudio\.com\/items\?itemName=zhangyahan\.vscode-opencode-terminal/,
+  );
+  assert.doesNotMatch(readme, /只通过 GitHub 分发/);
 });

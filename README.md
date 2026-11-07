@@ -2,7 +2,7 @@
 
 在 VS Code **Secondary Sidebar（辅助侧边栏，默认位于窗口右侧）**中直接运行 **OpenCode 的真实 TUI**。同一个 `opencodeTerminalSecondary` 容器中，上方是 xterm/OpenCode webview 主区域，下方紧邻一个小型原生 **“拖入文件”** TreeView：把 Explorer 中选中的多个文件拖到该原生区域，0.0.8 会始终以纯文本 `@路径` 插入**整文件**引用；只有多行编辑器选区才通过 OpenCode 内部 editor WebSocket 结构化插入，单行选区回退为 `@路径#行-行`。所有情况都**不会按回车/Tab，也不会执行任意拖入文本**，引用需在 OpenCode 中手动确认。
 
-仓库：[zhangyahan/vscode-opencode-terminal](https://github.com/zhangyahan/vscode-opencode-terminal)。本扩展只通过 GitHub 分发，未发布到 VS Code Marketplace。
+仓库：[zhangyahan/vscode-opencode-terminal](https://github.com/zhangyahan/vscode-opencode-terminal)。发布配置使用 VS Code Marketplace Publisher `zhangyahan`，扩展 ID 为 `zhangyahan.vscode-opencode-terminal`；Marketplace 条目生效前，请使用下方 VSIX 安装。
 
 ## 0.0.8 的变化
 
@@ -81,9 +81,19 @@
 
 ## 安装
 
+Marketplace 扩展 ID：`zhangyahan.vscode-opencode-terminal`（`win32-x64`，VS Code `^1.106.0`）。
+
+```powershell
+code --install-extension zhangyahan.vscode-opencode-terminal
+```
+
+Marketplace 条目生效前，或需要离线安装当前 0.0.8 构建时：
+
 ```powershell
 code --install-extension vscode-opencode-terminal-0.0.8-win32-x64.vsix
 ```
+
+Marketplace：[zhangyahan.vscode-opencode-terminal](https://marketplace.visualstudio.com/items?itemName=zhangyahan.vscode-opencode-terminal)。此前通过本地 `publisher: local` 构建的 VSIX 安装用户，Marketplace 版本会使用新的扩展 ID `zhangyahan.vscode-opencode-terminal`；安装后不会自动替换或卸载旧的 `local.vscode-opencode-terminal` 条目，请自行确认并卸载旧条目。本扩展不会自动卸载任何扩展。
 
 安装或升级后请 **完整 Reload Window**。0.0.8 不再贡献旧 `viewsContainers.panel` 容器；如果曾手动移动/固定过 OpenCode 视图，可能需要在视图标题菜单选择 **Reset Location**。扩展不会写入 VS Code storage 布局，也不会重置全部视图。
 
@@ -160,7 +170,7 @@ VSIX 内含 `@lydell/node-pty` 的 N-API 预编译产物，以及桥接使用的
 8. 系统文件管理器拖入的文件只有在公开 API 暴露 `DataTransferItem.asFile()?.uri` 时才能使用；没有路径时只提示，不猜测。Explorer 内部拖到 webview 区域仍可能被平台 iframe 拦截，原生“拖入文件”区域是稳定入口。
 9. 已构建 VSIX 只针对 `win32-x64`，不声称支持 macOS/Linux。
 10. `initialSize` 90/10 只影响首次布局权重，不是固定高度；VS Code 可能按容器可用空间和 TreeView 最小高度调整，用户可拖动分隔线。
-11. `publisher` 是本地占位值，未做 Marketplace 发布配置。
+11. `publisher` 已配置为 `zhangyahan`（扩展 ID `zhangyahan.vscode-opencode-terminal`）；Marketplace 实际可见性以市场页面为准。已构建 VSIX 只针对 `win32-x64`。
 12. editor WebSocket 是 OpenCode TUI 的内部接口（`packages/tui/src/context/editor.ts`），不是公开稳定 API；协议版本或 `clientInfo.name` 变化时扩展会拒绝握手并回退文本。只有 TUI 明确支持 `initialize` / `notifications/initialized` / `at_mentioned` 时才可能结构化插入。
 13. 桥接没有 ACK/确认帧；“已发送引用添加请求（未提交）”只表示帧已写入 socket，不表示 OpenCode 已完成插入。
 14. 整文件引用始终是纯文本 `@path`；多行选区在桥接未连接/握手未完成时也只能文本回退；单行选区固定文本回退。所有文本仍需用户在 OpenCode 中手动确认。
@@ -170,7 +180,8 @@ VSIX 内含 `@lydell/node-pty` 的 N-API 预编译产物，以及桥接使用的
 ## 版本与平台
 
 - 版本：`0.0.8`
-- 目标平台：`win32-x64`
+- 扩展 ID：`zhangyahan.vscode-opencode-terminal`
+- 目标平台：`win32-x64`（最低 VS Code `^1.106.0`）
 - VSIX：`vscode-opencode-terminal-0.0.8-win32-x64.vsix`
 
 ## 开发与测试
@@ -194,9 +205,9 @@ npm run package      # 生成 win32-x64 VSIX
 - `ptyAdapter.integration`：真实加载随包安装的 N-API 预编译 node-pty，运行一个短命令 `echo PTY_NATIVE_OK`，不启动 OpenCode。该文件沿用 `--test-force-exit` 仅用于关闭 node-pty 的 native handle；新增 bridge 测试不依赖它。
 - `webviewInteraction`：行为级模拟 keydown/keypress/keyup、IME、普通 Enter 与 Ctrl+C/Ctrl+V，断言一次 Shift+Enter 只产生一个 LF 且绝不产生 CR；用注入的 fake scheduler 验证 100 次连续 resize 只触发一次 trailing fit、初始/快照 fitNow 即时执行、取消/隐藏/零尺寸不 fit、恢复后重新 fit。测试不加载 xterm 真实 DOM。
 - `extension.integration`：mock VS Code 下验证自动 spawn 一次、profile args/env/cwd、bridge 端口 env 覆盖、ready/attach 实际尺寸与已运行 PTY resize、输入/输出/退出、多行选区走结构化桥接、整文件仅写 `@path` 且不打开文档/不调用 bridge、单行与断开时仅文本无 Enter、bridge 启动失败清理、PTY 退出/移除工作区/dispose 关闭 bridge、untrusted 不启动 bridge、CodeEditors options.selection、工作区配置确认、拒绝工作区配置时不用 workspace 解析的 `vscode.env.shell`；另用 mock 原生 TreeView/DataTransfer 验证多文件整文件仅 `@路径` 不含 `#`、`CodeFiles` 原生路径、`asFile()?.uri`、目录跳过、非法 MIME、无 PTY、untrusted 与异步 `asString` 失败均不误写。
-- `manifest`：契约检查只贡献 `secondarySidebar` 且无 `panel`、TUI/drop 视图顺序与 90/10 `initialSize`、旧 view/命令 ID 保留、VS Code 最低版本 `^1.106.0` 以及 0.0.8 VSIX 文件名。
+- `manifest`：契约检查只贡献 `secondarySidebar` 且无 `panel`、TUI/drop 视图顺序与 90/10 `initialSize`、旧 view/命令 ID 保留、VS Code 最低版本 `^1.106.0`、0.0.8 VSIX 文件名，以及 Marketplace publisher/安装 ID 为 `zhangyahan.vscode-opencode-terminal`。
 
-当前测试数：**128 个通过**（`npm test`，不含单独运行的 1 个 node-pty native smoke）。这些 bridge 测试使用真实 WebSocket 客户端，但仍是协议级 mock，不等于已证明真实 OpenCode TUI 插入成功；`webviewInteraction` 也不等于真实浏览器 IME/拖动 UI 验证。
+当前测试数：**129 个通过**（`npm test`，不含单独运行的 1 个 node-pty native smoke）。这些 bridge 测试使用真实 WebSocket 客户端，但仍是协议级 mock，不等于已证明真实 OpenCode TUI 插入成功；`webviewInteraction` 也不等于真实浏览器 IME/拖动 UI 验证。
 
 ### 原生加载证据与限制
 

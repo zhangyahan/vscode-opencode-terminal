@@ -3,7 +3,7 @@
   "displayName": "OpenCode Terminal",
   "description": "Run OpenCode's real TUI inside the VS Code Secondary Sidebar using xterm.js + node-pty, with a native file drop target and @mentions.",
   "version": "0.0.8",
-  "publisher": "local",
+  "publisher": "zhangyahan",
   "license": "MIT",
   "repository": {
     "type": "git",
