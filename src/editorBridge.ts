@@ -26,7 +26,7 @@ export const MAX_EDITOR_MESSAGE_BYTES = 64 * 1024;
 export const MAX_EDITOR_CLIENTS = 1;
 export const HANDSHAKE_TIMEOUT_MS = 5_000;
 export const EDITOR_SERVER_NAME = 'vscode-opencode-terminal';
-export const EDITOR_SERVER_VERSION = '0.0.12';
+export const EDITOR_SERVER_VERSION = '0.0.14';
 
 export interface EditorMentionParams {
   readonly filePath: string;

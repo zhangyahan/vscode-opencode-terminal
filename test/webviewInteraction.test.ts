@@ -4,11 +4,16 @@ import assert from 'node:assert/strict';
 import {
   FIT_DEBOUNCE_MS,
   NEWLINE_INPUT,
+  NOTICE_MAX_TIMEOUT_MS,
+  NotificationController,
   TerminalFitDebouncer,
   applyTerminalKey,
   canFitTerminal,
   decideTerminalKey,
+  hostErrorNotice,
   isImeCompositionEvent,
+  stateErrorNotice,
+  workspaceButtonView,
   type TerminalFitEnvironment,
   type TerminalKeyDecision,
   type TerminalKeyEventLike,
@@ -374,6 +379,49 @@ test('hidden or zero-sized terminal is not fitted, then fits again after recover
   assert.equal(fits, 1);
 });
 
+test('workspace-mode toolbar shows the real cwd basename and stays enabled for a single-root workspace file', () => {
+  const workspace = workspaceButtonView({
+    workspaceMode: true,
+    ownerName: 'demo-project',
+    workingDirectory: 'D:/Workspace/FR',
+    workspaceCount: 1,
+    trusted: true,
+  });
+  assert.equal(workspace.label, '工作目录：FR');
+  assert.equal(workspace.disabled, false, 'a single-root .code-workspace must stay clickable');
+  assert.match(workspace.title, /D:\/Workspace\/FR/);
+  assert.match(workspace.title, /项目（owner）：demo-project/);
+
+  const unselected = workspaceButtonView({
+    workspaceMode: true,
+    ownerName: 'demo-project',
+    workingDirectory: '',
+    workspaceCount: 1,
+    trusted: true,
+  });
+  assert.equal(unselected.label, '工作目录：未选择');
+  assert.equal(unselected.disabled, false);
+
+  const untrusted = workspaceButtonView({
+    workspaceMode: true,
+    ownerName: 'demo-project',
+    workingDirectory: 'D:/Workspace/FR',
+    workspaceCount: 1,
+    trusted: false,
+  });
+  assert.equal(untrusted.disabled, true);
+
+  const normal = workspaceButtonView({
+    workspaceMode: false,
+    ownerName: 'demo',
+    workingDirectory: 'C:/demo',
+    workspaceCount: 1,
+    trusted: true,
+  });
+  assert.equal(normal.label, 'demo');
+  assert.equal(normal.disabled, true, 'normal single-folder behavior is unchanged');
+});
+
 test('dispose clears the pending timer and blocks later fits', () => {
   const scheduler = new FakeScheduler();
   let fits = 0;
@@ -397,4 +445,337 @@ test('dispose clears the pending timer and blocks later fits', () => {
   debouncer.fitNow();
   scheduler.runAll();
   assert.equal(fits, 0);
+});
+
+interface NotificationHarness {
+  readonly scheduler: FakeScheduler;
+  readonly rendered: string[];
+  readonly controller: NotificationController;
+  clears: number;
+}
+
+const TEST_EPOCH = 'epoch-test';
+
+function notificationHarness(
+  initialLastNoticeEpoch = '',
+  initialLastNoticeId = 0,
+  timeoutMs?: number,
+): NotificationHarness {
+  const scheduler = new FakeScheduler();
+  const rendered: string[] = [];
+  const harness: NotificationHarness = {
+    scheduler,
+    rendered,
+    clears: 0,
+    controller: new NotificationController({
+      scheduler,
+      render: (message) => rendered.push(message),
+      clear: () => {
+        harness.clears += 1;
+      },
+      initialLastNoticeEpoch,
+      initialLastNoticeId,
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    }),
+  };
+  return harness;
+}
+
+test('notification policy never overlays info notices, status text or restart hints', () => {
+  const harness = notificationHarness();
+
+  assert.equal(
+    harness.controller.handleHostNotice({
+      epoch: TEST_EPOCH,
+      id: 1,
+      kind: 'info',
+      message: '已在 demo 启动 PTY。',
+    }),
+    false,
+  );
+  assert.equal(harness.controller.handleHostNotice(null), false);
+  assert.equal(
+    stateErrorNotice({ status: 'PTY 未启动。请点击“重启”。', ptyActive: false }),
+    null,
+  );
+  assert.equal(
+    stateErrorNotice({
+      status: 'PTY 运行中',
+      restartRecommended: true,
+      notice: null,
+    }),
+    null,
+  );
+  assert.equal(
+    stateErrorNotice({
+      notice: {
+        epoch: TEST_EPOCH,
+        id: 2,
+        kind: 'info',
+        message: '已复制到剪贴板。',
+      },
+    }),
+    null,
+  );
+
+  assert.deepEqual(harness.rendered, []);
+  assert.equal(harness.scheduler.pending, 0);
+});
+
+test('a host error renders once and auto-dismisses after at most six seconds', () => {
+  const harness = notificationHarness();
+  const notice = stateErrorNotice({
+    notice: {
+      epoch: TEST_EPOCH,
+      id: 7,
+      kind: 'error',
+      message: '写入 PTY 失败。',
+    },
+  });
+
+  assert.deepEqual(notice, {
+    epoch: TEST_EPOCH,
+    id: 7,
+    kind: 'error',
+    message: '写入 PTY 失败。',
+  });
+  assert.equal(NOTICE_MAX_TIMEOUT_MS, 6000);
+  assert.equal(harness.controller.handleHostNotice(notice), true);
+  assert.deepEqual(harness.rendered, ['写入 PTY 失败。']);
+  assert.deepEqual(harness.scheduler.delays, [6000]);
+  assert.equal(harness.scheduler.pending, 1);
+
+  harness.scheduler.runAll();
+  assert.equal(harness.clears, 1);
+
+  const capped = notificationHarness(TEST_EPOCH, 0, 60_000);
+  assert.equal(
+    capped.controller.handleHostNotice({
+      epoch: TEST_EPOCH,
+      id: 70,
+      kind: 'error',
+      message: '超长超时也必须截断。',
+    }),
+    true,
+  );
+  assert.deepEqual(capped.scheduler.delays, [6000]);
+});
+
+test('replaying the same notice id neither re-renders nor renews the timer', () => {
+  const harness = notificationHarness();
+  const notice = {
+    epoch: TEST_EPOCH,
+    id: 8,
+    kind: 'error',
+    message: '同一事件。',
+  };
+
+  assert.equal(harness.controller.handleHostNotice(notice), true);
+  assert.equal(harness.scheduler.setCalls, 1);
+  assert.equal(harness.scheduler.clearCalls, 0);
+
+  assert.equal(harness.controller.handleHostNotice(notice), false);
+  assert.equal(harness.controller.handleHostNotice({ ...notice }), false);
+  assert.equal(harness.scheduler.setCalls, 1, 'same id must not restart the timer');
+  assert.equal(harness.scheduler.clearCalls, 0);
+  assert.deepEqual(harness.rendered, ['同一事件。']);
+});
+
+test('dismiss keeps the epoch and id so the same event cannot bounce back', () => {
+  const harness = notificationHarness();
+  const notice = {
+    epoch: TEST_EPOCH,
+    id: 9,
+    kind: 'error',
+    message: '可关闭错误。',
+  };
+
+  assert.equal(harness.controller.handleHostNotice(notice), true);
+  harness.controller.dismiss();
+  assert.equal(harness.clears, 1);
+  assert.equal(harness.scheduler.pending, 0);
+
+  assert.equal(harness.controller.handleHostNotice(notice), false);
+  assert.deepEqual(harness.rendered, ['可关闭错误。']);
+});
+
+test('a new id with identical text can be shown after the previous event', () => {
+  const harness = notificationHarness();
+
+  assert.equal(
+    harness.controller.handleHostNotice({
+      epoch: TEST_EPOCH,
+      id: 10,
+      kind: 'error',
+      message: '同样的文案。',
+    }),
+    true,
+  );
+  harness.controller.dismiss();
+  assert.equal(
+    harness.controller.handleHostNotice({
+      epoch: TEST_EPOCH,
+      id: 11,
+      kind: 'error',
+      message: '同样的文案。',
+    }),
+    true,
+    'a new user operation must not be deduplicated by message text',
+  );
+  assert.deepEqual(harness.rendered, ['同样的文案。', '同样的文案。']);
+});
+
+test('same-epoch webview rebuild ignores replayed ids but accepts newer errors', () => {
+  const harness = notificationHarness(TEST_EPOCH, 20);
+
+  assert.equal(
+    harness.controller.handleHostNotice({
+      epoch: TEST_EPOCH,
+      id: 20,
+      kind: 'error',
+      message: '旧事件。',
+    }),
+    false,
+  );
+  assert.deepEqual(harness.rendered, []);
+
+  assert.equal(
+    harness.controller.handleHostNotice({
+      epoch: TEST_EPOCH,
+      id: 21,
+      kind: 'error',
+      message: '新错误。',
+    }),
+    true,
+  );
+  assert.deepEqual(harness.rendered, ['新错误。']);
+});
+
+test('a new host epoch accepts its id 1 and resets the replay boundary', () => {
+  const harness = notificationHarness('old-epoch', 50);
+
+  assert.equal(
+    harness.controller.handleHostNotice({
+      epoch: 'new-epoch',
+      id: 1,
+      kind: 'error',
+      message: '扩展宿主重启后的第一个错误。',
+    }),
+    true,
+    'a restarted host must not be swallowed by the persisted old id',
+  );
+  assert.equal(harness.controller.lastNoticeEpoch, 'new-epoch');
+  assert.equal(harness.controller.lastNoticeId, 1);
+  assert.deepEqual(harness.rendered, ['扩展宿主重启后的第一个错误。']);
+
+  assert.equal(
+    harness.controller.handleHostNotice({
+      epoch: 'new-epoch',
+      id: 1,
+      kind: 'error',
+      message: '扩展宿主重启后的第一个错误。',
+    }),
+    false,
+    'the same new-epoch event still cannot replay',
+  );
+
+  assert.equal(
+    harness.controller.handleHostNotice({
+      epoch: 'third-epoch',
+      id: 1,
+      kind: 'error',
+      message: '再次重启后的错误。',
+    }),
+    true,
+    'another distinct host epoch accepts its own id 1',
+  );
+  assert.equal(harness.controller.lastNoticeEpoch, 'third-epoch');
+});
+
+test('local drop errors use the same auto-dismiss path without a host epoch', () => {
+  const harness = notificationHarness(TEST_EPOCH, 5);
+
+  assert.equal(harness.controller.showLocalError('未识别到文件。'), true);
+  assert.deepEqual(harness.rendered, ['未识别到文件。']);
+  assert.deepEqual(harness.scheduler.delays, [6000]);
+  harness.controller.dismiss();
+  assert.equal(harness.clears, 1);
+  assert.equal(harness.controller.lastNoticeEpoch, TEST_EPOCH);
+  assert.equal(harness.controller.lastNoticeId, 5);
+});
+
+test('dispose clears the pending notice timer and ignores later notices', () => {
+  const harness = notificationHarness();
+
+  assert.equal(
+    harness.controller.handleHostNotice({
+      epoch: TEST_EPOCH,
+      id: 30,
+      kind: 'error',
+      message: '等待超时。',
+    }),
+    true,
+  );
+  assert.equal(harness.scheduler.pending, 1);
+
+  harness.controller.dispose();
+  assert.equal(harness.scheduler.pending, 0);
+  assert.equal(
+    harness.controller.handleHostNotice({
+      epoch: 'new-epoch',
+      id: 1,
+      kind: 'error',
+      message: '不应显示。',
+    }),
+    false,
+  );
+  harness.scheduler.runAll();
+  assert.deepEqual(harness.rendered, ['等待超时。']);
+});
+
+test('hostErrorNotice rejects missing epoch or id so an old protocol cannot stick forever', () => {
+  assert.equal(
+    hostErrorNotice({ kind: 'error', message: '没有 id。' }),
+    null,
+  );
+  assert.equal(
+    hostErrorNotice({
+      epoch: TEST_EPOCH,
+      id: 1.5,
+      kind: 'error',
+      message: '非整数 id。',
+    }),
+    null,
+  );
+  assert.equal(
+    hostErrorNotice({
+      epoch: TEST_EPOCH,
+      id: 0,
+      kind: 'error',
+      message: '零 id。',
+    }),
+    null,
+  );
+  assert.equal(
+    hostErrorNotice({
+      epoch: TEST_EPOCH,
+      id: 3,
+      kind: 'error',
+      message: '',
+    }),
+    null,
+  );
+  assert.equal(
+    hostErrorNotice({ id: 3, kind: 'error', message: '没有 epoch。' }),
+    null,
+  );
+  assert.equal(
+    hostErrorNotice({
+      epoch: '',
+      id: 3,
+      kind: 'error',
+      message: '空 epoch。',
+    }),
+    null,
+  );
 });

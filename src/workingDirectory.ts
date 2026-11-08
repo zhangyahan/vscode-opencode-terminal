@@ -63,6 +63,21 @@ export type WorkingDirectoryResult =
 
 type PathFlavor = 'windows' | 'posix';
 
+/**
+ * Workspace mode is defined by VS Code's workspace file (saved or untitled
+ * `.code-workspace`) or by having more than one workspace folder. In that mode
+ * the extension never guesses a project root as the PTY cwd: the user must
+ * choose the real working directory.
+ */
+export function isWorkspaceMode(
+  workspaceFile: unknown,
+  folderCount: number,
+): boolean {
+  return (
+    (workspaceFile !== undefined && workspaceFile !== null) || folderCount > 1
+  );
+}
+
 function failure(
   code: WorkingDirectoryErrorCode,
   message: string,

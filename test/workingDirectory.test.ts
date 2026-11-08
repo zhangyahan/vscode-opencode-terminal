@@ -2,12 +2,23 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  isWorkspaceMode,
   resolveWorkingDirectory,
   type WorkingDirectoryResult,
 } from '../src/workingDirectory';
 
 const WINDOWS_WORKSPACE = 'D:/Workspace/FR';
 const WINDOWS_HOME = 'C:/Users/tester';
+
+test('workspace mode covers workspace files and multiple folders only', () => {
+  assert.equal(isWorkspaceMode(undefined, 1), false);
+  assert.equal(isWorkspaceMode(undefined, 0), false);
+  assert.equal(isWorkspaceMode(undefined, 2), true);
+  assert.equal(isWorkspaceMode({ scheme: 'file' }, 1), true);
+  assert.equal(isWorkspaceMode({ scheme: 'untitled' }, 1), true);
+  assert.equal(isWorkspaceMode({ scheme: 'untitled' }, 0), true);
+  assert.equal(isWorkspaceMode(null, 1), false);
+});
 
 function resolve(
   value: unknown,

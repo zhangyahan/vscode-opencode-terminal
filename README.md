@@ -1,8 +1,25 @@
 # OpenCode Terminal by ZhangYahan
 
-在 VS Code **底部 Panel（面板）**中直接运行 **OpenCode 的真实 TUI**。同一个 `opencodeTerminalBottom` 容器中，左侧是小型原生 **“拖入文件”** TreeView，右侧是 xterm/OpenCode webview 主区域：把 Explorer 中选中的多个文件拖到左侧原生区域，0.0.12 会始终以纯文本 `@路径` 插入**整文件**引用；只有多行编辑器选区才通过 OpenCode 内部 editor WebSocket 结构化插入，单行选区回退为 `@路径#行-行`。所有情况都**不会按回车/Tab，也不会执行任意拖入文本**，引用需在 OpenCode 中手动确认。
+在 VS Code **底部 Panel（面板）**中直接运行 **OpenCode 的真实 TUI**。同一个 `opencodeTerminalBottom` 容器中，左侧是小型原生 **“拖入文件”** TreeView，右侧是 xterm/OpenCode webview 主区域：把 Explorer 中选中的多个文件拖到左侧原生区域，扩展会始终以纯文本 `@路径` 插入**整文件**引用；只有多行编辑器选区才通过 OpenCode 内部 editor WebSocket 结构化插入，单行选区回退为 `@路径#行-行`。所有情况都**不会按回车/Tab，也不会执行任意拖入文本**，引用需在 OpenCode 中手动确认。
 
 仓库：[zhangyahan/vscode-opencode-terminal](https://github.com/zhangyahan/vscode-opencode-terminal)。发布配置使用 VS Code Marketplace Publisher `zhangyahan`，扩展 ID 为 `zhangyahan.vscode-opencode-terminal`；Marketplace 条目生效前，请使用下方 VSIX 安装。
+
+## 0.0.14 的变化
+
+- **成功操作不再弹浮层**：正常启动/复用 PTY、添加引用、复制、设置引用基准、取消目录选择等 info 结果不再出现在 TUI 右上角的 notice 浮层；必要状态仍保留在顶部工具栏的 shell/工作目录 tooltip 中。重启建议（`restartRecommended`）只在“重启”按钮上做轻量边框标记并在 tooltip 说明，不再反复弹浮层。
+- **只有错误短显且可关闭**：仅 host 或本地拖放产生的真实 error 使用浮层，最多 6 秒自动消失，并提供关闭按钮；浮层容器 `pointer-events: none`、只有关闭按钮可点击，不会挡住终端操作。每次扩展宿主激活会生成随机 notice epoch；同一 epoch 的同一 id 因 postState/attach/snapshot 重放不会再次弹出或续期，关闭后同一事件不会回弹；新用户操作产生的新 id 即使文案相同仍会显示。宿主重启后的新 epoch 即使从 id 1 重新计数也会正常显示，不会被旧持久 id 吞掉。webview 仅持久化 `lastNoticeEpoch` 与 `lastNoticeId`，同 epoch 重建后不回放旧事件。
+- **取消永驻状态 notice**：无 PTY、PTY 已退出、工作区未选择等状态只写入工具栏 tooltip；PTY 退出错误只自动消失一次，不再 `timeout=0` 常驻。snapshot backlog 截断改为静默工具栏 tooltip。
+- **与 OpenCode TUI 自身提示区分**：本扩展只控制自己的 webview 浮层，不拦截、不修改 OpenCode TUI 自身的 toast/提示，也不修改 `cli.json`；无法声称可以关闭上游提示。
+- 版本 `0.0.14`。升级后请 **完整 Reload Window** 让新的扩展宿主和 webview 代码生效。自动化测试为 fake timer/注入式行为测试，**未在真实宿主中验证浮层 pointer-events、关闭按钮点击和 TUI 自身提示**。
+
+## 0.0.13 的变化
+
+- **工作区模式不再猜项目根**：只要当前窗口存在 `.code-workspace`（已保存或 untitled）或打开了多个工作区文件夹，就进入工作区模式。工作区模式启动/重启时**不再弹项目 Quick Pick**，而是用 VS Code 原生文件夹选择框选择真正的 OpenCode 工作目录，例如 `D:/Workspace/FR` 或多个 root 的共同父目录。取消或目录无效时不会 spawn、不会启动 editor bridge，也不会静默回退到项目 root。
+- **owner 与 cwd 明确分离**：工作区模式固定以第一个工作区文件夹作为会话 owner（用于 session key、配置作用域和生命周期），但该 owner **不是**实际 cwd。原生目录选择只用于启动目录，不会创建虚拟 WorkspaceFolder。选择成功后按“当前 workspace 文件 + owner”记忆到 `workspaceState`；重启或下次打开面板会复用，目录失效才重新选择。扩展 dispose 不清除该记忆，方便下次复用。
+- **顶部按钮显示真实工作目录**：工作区模式下按钮文案为 `工作目录：<实际 cwd 的 basename>`，tooltip 显示完整 cwd 和 owner 项目名；即使是单 root 的 `.code-workspace` 也可点击切换，不再依赖 root 数量隐藏按钮。状态/snapshot 同时提供 `workspaceName`（owner 项目）、`workingDirectory`（真实 cwd）和 `workspaceMode`，不会再把 owner 名称当成工作目录。
+- **显式设置优先**：非空 `opencodeTerminal.workingDirectory` 仍然优先于记忆选择，工作区模式下也不会再弹目录框；手动点按钮切换时只提示“设置优先，请修改或清空设置”，不会静默覆盖配置。切换目录时如已有活跃 PTY，会先明确确认“将结束当前 OpenCode 会话并用新目录重启”；取消不 kill、不改记忆，确认后只弹一次目录框并用新 cwd 重启。
+- **普通单文件夹保持原行为**：没有 workspace 文件的单 root 窗口仍自动使用该 root 作为 cwd，不弹任何选择框。没有工作区文件夹的 `.code-workspace` 不会 spawn，并提示先添加工作区文件夹。
+- 版本 `0.0.13`。升级后请 **完整 Reload Window** 让新的扩展宿主和 webview 代码生效。自动化测试为注入式行为测试，**未在真实宿主中验证原生目录框、确认弹窗和 Panel 布局**。
 
 ## 0.0.12 的变化
 
@@ -49,7 +66,7 @@
 - 升级到 0.0.7 需要 **完整 Reload Window**。扩展不写 VS Code storage 布局，也不重置全部视图；如果曾手动移动/固定过这些视图，可能需要在视图标题菜单选择 **Reset Location** 才会回到新的辅助侧边栏容器。
 - 版本要求提升到 VS Code `^1.106.0`（`secondarySidebar` contribution 自 1.106 起可用）。
 
-> 以下 0.0.8 及更早章节是历史变更记录；其中的“底部面板”“原生区域在上”等只描述当时版本。0.0.12 的当前行为以 0.0.12 章节和“功能”章节为准。
+> 以下 0.0.8 及更早章节是历史变更记录；其中的“底部面板”“原生区域在上”等只描述当时版本。0.0.14 的当前行为以 0.0.14 章节和“功能”章节为准。
 
 ## 0.0.6 的变化
 
@@ -99,12 +116,12 @@
   - 纯文本只有在 5 分钟选区缓存中**精确且唯一**匹配时才生成行号；无匹配时提示使用右键“添加当前选区”，不会把任意文本执行到终端。
 - 支持 Ctrl+C 复制 xterm 选区（有选区时不向 PTY 发送 Ctrl+C；无选区时 Ctrl+C 仍作为终端中断发送）。Ctrl+V/Cmd+V 只拦截 xterm 原始 `\x16`，不再读取宿主剪贴板；粘贴文本由 VS Code webview 的原生 DOM paste 经 `terminal.onData` 写入 PTY 一次。连续相同内容粘贴两次会写入两次，不做去重；右键原生粘贴和拖放保持原样。
 - 支持 Shift+Enter 换行：映射为 OpenCode 默认 Ctrl+J 的裸 LF，不发送 CR、不提交；普通 Enter 仍提交。IME 组合输入期间（`isComposing`/keyCode 229/key `Process`）本扩展的按键处理全部放行，不会吞掉选词回车。
-- 有限输出缓冲（约 200 KB）。超过时 webview 会提示较早的输出已截断；这是屏幕恢复缓冲，不是无损日志。
+- 有限输出缓冲（约 200 KB）。超过时较早的输出会被截断，截断信息只显示在顶部 shell 状态 tooltip 中；这是屏幕恢复缓冲，不是无损日志。
 
 ## 环境要求
 
 - VS Code `^1.106.0`（沿用既有最低版本基线，本版本未降低或抬高）。
-- **Windows x64**：0.0.12 的已构建 VSIX 只声明并验证了 `win32-x64`。其他平台的理论依赖已由上游提供，但本版本没有验证，也不会声称支持。
+- **Windows x64**：0.0.14 的已构建 VSIX 只声明并验证了 `win32-x64`。其他平台的理论依赖已由上游提供，但本版本没有验证，也不会声称支持。
 - 本地已安装 OpenCode CLI，并且在 VS Code 默认终端环境中能执行 `opencode`。
 - 工作区必须处于 **Workspace Trust**。限制模式下扩展不会 spawn PTY 或向终端写入任何内容。
 
@@ -116,10 +133,10 @@ Marketplace 扩展 ID：`zhangyahan.vscode-opencode-terminal`（`win32-x64`，VS
 code --install-extension zhangyahan.vscode-opencode-terminal
 ```
 
-Marketplace 条目生效前，或需要离线安装当前 0.0.12 构建时：
+Marketplace 条目生效前，或需要离线安装当前 0.0.14 构建时：
 
 ```powershell
-code --install-extension vscode-opencode-terminal-0.0.12-win32-x64.vsix
+code --install-extension vscode-opencode-terminal-0.0.14-win32-x64.vsix
 ```
 
 Marketplace：[zhangyahan.vscode-opencode-terminal](https://marketplace.visualstudio.com/items?itemName=zhangyahan.vscode-opencode-terminal)。此前通过本地 `publisher: local` 构建的 VSIX 安装用户，Marketplace 版本会使用新的扩展 ID `zhangyahan.vscode-opencode-terminal`；安装后不会自动替换或卸载旧的 `local.vscode-opencode-terminal` 条目，请自行确认并卸载旧条目。本扩展不会自动卸载任何扩展。
@@ -132,9 +149,10 @@ VSIX 内含 `@lydell/node-pty` 的 N-API 预编译产物，以及桥接使用的
 
 ### 启动与重启
 
-- 单根工作区：首次打开面板时自动启动一次 PTY，并执行 `opencodeTerminal.command`（默认 `opencode`）。
-- 多根工作区：首次打开面板会弹出工作区选择；之后可在顶部工作区按钮切换。
-- 顶部“重启”会杀掉当前工作区的 PTY 并重新启动；不会恢复上一个终端里的进程。
+- 普通单文件夹（没有 `.code-workspace`）：首次打开面板时自动启动一次 PTY，并以该文件夹作为 `cwd`，不弹选择框。
+- 工作区模式（存在 `.code-workspace` 或打开多个文件夹）：首次打开面板会弹出**原生文件夹选择框**选择实际工作目录，不再出现项目 Quick Pick；owner 固定为第一个工作区文件夹，仅用于 session/config 命名空间。
+- 顶部“重启”会杀掉当前 owner 的 PTY 并重新启动；如果工作区模式已有有效的记忆目录，不会重复弹出目录框。
+- 顶部“工作目录”按钮：工作区模式显示当前真实 cwd 的 basename，点击可重新选择目录；普通单 root 时保持原来的工作区切换行为。已有活跃 PTY 时会先确认切换会结束当前会话。
 - 面板隐藏/切走时会保留 PTY 和 xterm 上下文。关闭面板视图不会立刻杀掉 PTY，重新打开会通过 snapshot 恢复；扩展 dispose/deactivate 或窗口重载会杀掉本扩展创建的 PTY，无法恢复会话。
 - 从多根工作区移除某个文件夹时，扩展会立即 kill 对应 PTY、清理 backlog/活动状态；如果移除的是当前活动工作区，会清空 xterm 或切换到唯一剩余工作区。
 
@@ -150,7 +168,7 @@ VSIX 内含 `@lydell/node-pty` 的 N-API 预编译产物，以及桥接使用的
 
 安全约束：
 
-- PTY 的启动 `cwd` 由 `opencodeTerminal.workingDirectory` 决定；空值使用选中的工作区 `folder.fsPath`。扩展只把它作为 `spawn` 参数和 shell profile 的 `${workspaceFolder}` 展开基准，不做 `/cd` 检测、不执行 shell 展开、不读取环境变量来推导路径。
+- PTY 的启动 `cwd` 由 `opencodeTerminal.workingDirectory` 决定；非空设置在工作区模式也优先。空值在普通单文件夹使用 `folder.fsPath`，在工作区模式使用已确认并记忆的真实目录（没有有效记忆时弹出原生目录框）。扩展只把它作为 `spawn` 参数和 shell profile 的 `${workspaceFolder}` 展开基准，不做 `/cd` 检测、不执行 shell 展开、不读取环境变量来推导路径。
 - 合并环境变量时会清理 `ELECTRON_RUN_AS_NODE` 等 Electron 宿主变量，并设置 `TERM=xterm-256color`、`COLORTERM=truecolor`。
 - 如果工作区设置包含 `terminal.integrated.profiles/env/defaultProfile`，首次启动会明确弹窗询问：使用工作区配置，或仅使用用户/默认配置。选择结果只缓存在当前扩展会话；相关设置变化后会重新询问。
 - 选择“仅使用用户配置”后，扩展**不会**使用 `vscode.env.shell` fallback：公开 API 无法判断该路径是否已被工作区 profile/defaultProfile 改写，因此只允许 user/default profile 的显式 `path`。如果用户默认 profile 只有 `source` 而没有 `path`，扩展会明确报错并要求在用户设置中补充 `terminal.integrated.profiles.<platform>` 的 `path`，不会猜测旧版 PowerShell 路径，也不会静默使用工作区路径。
@@ -158,7 +176,9 @@ VSIX 内含 `@lydell/node-pty` 的 N-API 预编译产物，以及桥接使用的
 - 无法解析所选 profile 时会显示明确错误，不会偷偷换成另一个 shell。Windows Terminal 只是 VS Code 的宿主终端，不需要也不内嵌 `wt.exe`。
 - 默认 shell/profile/env 设置变化后，状态中会提示“重启 PTY 后生效”；扩展不会自动杀掉正在运行的 TUI。
 
-### 多根工作区与引用基准（0.0.11）
+### 多根工作区与引用基准（0.0.11，0.0.13 起自动选择目录）
+
+从 0.0.13 起，只要存在 `.code-workspace` 或多个 root，首次启动就会用原生文件夹框让你选择真实工作目录（例如共同父目录 `D:/Workspace/FR`）。选择成功后该 cwd 同时用于 spawn、shell profile 的 `${workspaceFolder}` 展开和之后的 `@` 引用基准，不再需要先靠 `workingDirectory` 设置才能得到相对引用。以下两种显式方式仍可用，并优先于目录记忆：
 
 如果 `D:/Workspace/FR` 下有多个 VS Code roots（例如 `FR`、`sai-qx-student-client`），且你在 OpenCode 中执行了 `/cd D:/Workspace/FR`，希望拖入 `D:/Workspace/FR/sai-qx-student-client/apps/mobile/src/a.ts` 时得到 `@sai-qx-student-client/apps/mobile/src/a.ts`，有两种显式做法：
 
@@ -228,10 +248,10 @@ VSIX 内含 `@lydell/node-pty` 的 N-API 预编译产物，以及桥接使用的
 
 ## 版本与平台
 
-- 版本：`0.0.12`
+- 版本：`0.0.14`
 - 扩展 ID：`zhangyahan.vscode-opencode-terminal`
 - 目标平台：`win32-x64`（最低 VS Code `^1.106.0`）
-- VSIX：`vscode-opencode-terminal-0.0.12-win32-x64.vsix`
+- VSIX：`vscode-opencode-terminal-0.0.14-win32-x64.vsix`
 
 ## 开发与测试
 
@@ -250,14 +270,14 @@ npm run package      # 生成 win32-x64 VSIX
 - `core` / `runtime`：mention/range 格式化、拖放解析（含真实 Windows/POSIX/UNC `CodeFiles` 路径、URI 兼容、多字段合并去重）、webview 协议、选区缓存、命令校验。
 - `references`：整文件/空选区固定纯文本 `@path`、多行选区、`end.character === 0`、单行回退、无效路径/范围、缺失 URI、URI+range 去重与数量上限。
 - `editorBridge`：真实 `ws` 客户端完成 `initialize -> notifications/initialized -> at_mentioned`；断开、未握手、Origin、非 opencode 初始化、替换旧连接、stop 清理均不得发送。
-- `workingDirectory`：空值回退、绝对路径/UNC/POSIX 归一化、三个受支持变量、env/command/未知/未展开变量拒绝、控制字符、drive-relative、非绝对路径与非字符串设置拒绝。
+- `workingDirectory`：空值回退、绝对路径/UNC/POSIX 归一化、三个受支持变量、env/command/未知/未展开变量拒绝、控制字符、drive-relative、非绝对路径与非字符串设置拒绝；`isWorkspaceMode` 覆盖 workspace 文件（含 untitled）与多 root，普通单 folder 不进入工作区模式。
 - `ptySession` / `shellProfile`：会话生命周期、输入/尺寸边界、输出 sequence/backlog、dispose；实际 spawn cwd 的只读查询和 stale session 拒绝；VS Code terminal profile 解析、环境合并、错误回退。
 - `ptyAdapter.integration`：真实加载随包安装的 N-API 预编译 node-pty，运行一个短命令 `echo PTY_NATIVE_OK`，不启动 OpenCode。该文件沿用 `--test-force-exit` 仅用于关闭 node-pty 的 native handle；新增 bridge 测试不依赖它。
-- `webviewInteraction`：行为级模拟 keydown/keypress/keyup、IME、普通 Enter 与 Ctrl+C/Ctrl+V；注入 post/input/selection 副作用，断言 Ctrl+V/Cmd+V keydown 只阻止原始 `\x16`，不读取剪贴板、不写 PTY；模拟原生 paste 一次只产生一次 onData，两次相同 paste 产生两次且无去重；Ctrl+Shift+V、keypress/keyup 不产生额外粘贴。另用注入的 fake scheduler 验证 100 次连续 resize 只触发一次 trailing fit、初始/快照 fitNow 即时执行、取消/隐藏/零尺寸不 fit、恢复后重新 fit。测试不加载 xterm 真实 DOM。
-- `extension.integration`：mock VS Code 下验证自动 spawn 一次、profile args/env/cwd、bridge 端口 env 覆盖、ready/attach 实际尺寸与已运行 PTY resize、输入/输出/退出、多行选区走结构化桥接、整文件仅写 `@path` 且不打开文档/不调用 bridge、单行与断开时仅文本无 Enter、bridge 启动失败清理、PTY 退出/移除工作区/dispose 关闭 bridge、untrusted 不启动 bridge、CodeEditors options.selection、工作区配置确认、拒绝工作区配置时不用 workspace 解析的 `vscode.env.shell`；旧 `readClipboard` 消息被拒绝且不读取剪贴板、不回发 `pasteText`；另用 mock 原生 TreeView/DataTransfer 验证多文件整文件仅 `@路径` 不含 `#`、`CodeFiles` 原生路径、`asFile()?.uri`、目录跳过、非法 MIME、无 PTY、untrusted 与异步 `asString` 失败均不误写。多根用例先启动单 root 会话，再通过真实的 `workspaceFolders` 事件注册其它 root；`getWorkspaceFolder` mock 按平台路径、大小写和最长 root 边界匹配，覆盖原生 TreeView/webview drop/Explorer addFile 跨 root、嵌套 root 相对路径、异盘/case、跨 root 多行 bridge 绝对路径与单行文本回退，并断言 spawn 次数、cwd、活动会话不变。0.0.11 另验证配置 cwd 启动 FR 但 owner/workspaceKey 仍为项目、引用生成 `@project/...`、shell profile 的 `${workspaceFolder}`/`${workspaceFolderBasename}` 与有效 cwd 同步；运行中改配置只提示重启且不改变当前引用基准；`setReferenceBase` 不写 PTY/不 spawn/不杀 bridge，目录选择默认当前基准；无效配置目录不 spawn/bridge、无效选择与 untrusted 不保存 override；选择期间会话变化拒绝保存；restart/exit/移除工作区后 override 失效。harness 注入 `statDirectory`、原生 folder dialog 返回值和可触发的配置变更事件。
-- `manifest`：契约检查只贡献底部 `panel` 容器 `opencodeTerminalBottom` 且无 `secondarySidebar`、drop/TUI 视图顺序与 1/99 `initialSize`、旧 view/命令 ID 保留、VS Code 最低版本 `^1.106.0`、0.0.12 VSIX 文件名、`workingDirectory` 的 `machine-overridable` 设置与 `setReferenceBase` 命令/标题/图标/`view/title` 入口，以及 Marketplace publisher/安装 ID 为 `zhangyahan.vscode-opencode-terminal`。
+- `webviewInteraction`：行为级模拟 keydown/keypress/keyup、IME、普通 Enter 与 Ctrl+C/Ctrl+V；注入 post/input/selection 副作用，断言 Ctrl+V/Cmd+V keydown 只阻止原始 `\x16`，不读取剪贴板、不写 PTY；模拟原生 paste 一次只产生一次 onData，两次相同 paste 产生两次且无去重；Ctrl+Shift+V、keypress/keyup 不产生额外粘贴。另用注入的 fake scheduler 验证 100 次连续 resize 只触发一次 trailing fit、初始/快照 fitNow 即时执行、取消/隐藏/零尺寸不 fit、恢复后重新 fit；并用同一纯函数验证工作区模式按钮显示真实 cwd basename、单 root `.code-workspace` 仍可点击、普通单 root 保持原行为。0.0.14 还以 fake timer 验证 notification controller：info/status/restart 不显示浮层、error 只显示一次并在 6 秒自动消失、重复 same epoch/id 不续期、关闭后不回弹、新 id 相同文案可再次显示、同 epoch 重建时忽略旧事件、新 host epoch 从 id 1 重新开始仍可显示、dispose 清 timer，以及本地拖放错误复用同一自动消失路径。测试不加载 xterm 真实 DOM。
+- `extension.integration`：mock VS Code 下验证自动 spawn 一次、profile args/env/cwd、bridge 端口 env 覆盖、ready/attach 实际尺寸与已运行 PTY resize、输入/输出/退出、多行选区走结构化桥接、整文件仅写 `@path` 且不打开文档/不调用 bridge、单行与断开时仅文本无 Enter、bridge 启动失败清理、PTY 退出/移除工作区/dispose 关闭 bridge、untrusted 不启动 bridge、CodeEditors options.selection、工作区配置确认、拒绝工作区配置时不用 workspace 解析的 `vscode.env.shell`；旧 `readClipboard` 消息被拒绝且不读取剪贴板、不回发 `pasteText`；另用 mock 原生 TreeView/DataTransfer 验证多文件整文件仅 `@路径` 不含 `#`、`CodeFiles` 原生路径、`asFile()?.uri`、目录跳过、非法 MIME、无 PTY、untrusted 与异步 `asString` 失败均不误写。多根用例先启动单 root 会话，再通过真实的 `workspaceFolders` 事件注册其它 root；`getWorkspaceFolder` mock 按平台路径、大小写和最长 root 边界匹配，覆盖原生 TreeView/webview drop/Explorer addFile 跨 root、嵌套 root 相对路径、异盘/case、跨 root 多行 bridge 绝对路径与单行文本回退，并断言 spawn 次数、cwd、活动会话不变。0.0.11 另验证配置 cwd 启动 FR 但 owner/workspaceKey 仍为项目、引用生成 `@project/...`、shell profile 的 `${workspaceFolder}`/`${workspaceFolderBasename}` 与有效 cwd 同步；运行中改配置只提示重启且不改变当前引用基准；`setReferenceBase` 不写 PTY/不 spawn/不杀 bridge，目录选择默认当前基准；无效配置目录不 spawn/bridge、无效选择与 untrusted 不保存 override；选择期间会话变化拒绝保存；restart/exit/移除工作区后 override 失效。0.0.13 另以行为测试验证单 root `.code-workspace` 和多 root 都只弹原生目录框、不弹项目 Quick Pick，普通单 root 无选择框，取消不 spawn/不建 bridge/不写 workspaceState，显式配置免目录框，重启复用记忆目录，记忆目录失效会重选，0 root 不 spawn，切换目录在活跃 PTY 时确认取消不 kill、确认后只弹一次目录框并用新 cwd 重启，且 owner/workspaceKey 始终是项目文件夹。0.0.14 另校验 `state.notice` 保留 message 兼容性并带有随机 epoch 与单调 id，同一 notice 在 postState 重放时 epoch/id 不变，不同 provider 激活的 epoch 不同且各自 id 1 都可显示。harness 注入 `statDirectory`、原生 folder dialog 返回值、Quick Pick 计数、workspaceState 种子/写入记录和可触发的配置变更事件。
+- `manifest`：契约检查只贡献底部 `panel` 容器 `opencodeTerminalBottom` 且无 `secondarySidebar`、drop/TUI 视图顺序与 1/99 `initialSize`、旧 view/命令 ID 保留、VS Code 最低版本 `^1.106.0`、0.0.14 VSIX 文件名、`workingDirectory` 的 `machine-overridable` 设置与 `setReferenceBase` 命令/标题/图标/`view/title` 入口，以及 Marketplace publisher/安装 ID 为 `zhangyahan.vscode-opencode-terminal`。
 
-当前测试数：**160 个通过**（`npm test`，不含单独运行的 1 个 node-pty native smoke）。这些 bridge 测试使用真实 WebSocket 客户端，但仍是协议级 mock，不等于已证明真实 OpenCode TUI 插入成功；`webviewInteraction` 也不等于真实浏览器 IME、剪贴板或拖动 UI 验证；跨 root 绝对/相对 `@path` 与 `/cd` 同步均未在真实宿主/OpenCode 中 e2e 验证。
+当前测试数：**182 个通过**（`npm test`，不含单独运行的 1 个 node-pty native smoke）。这些 bridge 测试使用真实 WebSocket 客户端，但仍是协议级 mock，不等于已证明真实 OpenCode TUI 插入成功；`webviewInteraction` 也不等于真实浏览器 IME、剪贴板、拖动 UI 或浮层 pointer-events 验证；跨 root 绝对/相对 `@path` 与 `/cd` 同步均未在真实宿主/OpenCode 中 e2e 验证。
 
 ### 原生加载证据与限制
 
@@ -267,7 +287,7 @@ npm run package      # 生成 win32-x64 VSIX
 
 ### 手工测试清单
 
-1. 安装/加载 0.0.12 后 **完整 Reload Window**，打开单根工作区，确认 OpenCode 出现在底部 Panel，左侧为小型“拖入文件”原生区域、右侧为 TUI。若某个视图仍停留在旧位置，使用对应视图标题菜单的 **Reset Location**。
+1. 安装/加载 0.0.14 后 **完整 Reload Window**，打开单根工作区，确认 OpenCode 出现在底部 Panel，左侧为小型“拖入文件”原生区域、右侧为 TUI。若某个视图仍停留在旧位置，使用对应视图标题菜单的 **Reset Location**。
 2. 确认自动执行 `opencode` 一次；再次打开面板不重复 spawn。
 3. 分别点击“拖入文件”和 TUI 视图标题的折叠控件，确认两个视图可独立折叠/展开，且展开后内容仍在；扩展不会新增折叠按钮或改变分隔线布局。
 4. 在 TUI 输入框执行 `Shift+Enter`，确认只换行不提交；普通 `Enter` 提交；`Ctrl+J` 仍换行。使用中文输入法选词时按 `Enter`，确认选词正常、不会被吞掉或误提交。
@@ -291,3 +311,11 @@ npm run package      # 生成 win32-x64 VSIX
 22. 检查状态提示没有声称“TUI 已确认插入”；断开桥接或停止 PTY 后再次添加引用，确认不会向旧 session/旧 bridge 发送。
 23. 在 `.code-workspace` 设置 `"opencodeTerminal.workingDirectory": "D:/Workspace/FR"` 并重启 PTY，确认新会话的 spawn cwd 是 FR，但活动工作区/owner 未改变；拖入 `D:/Workspace/FR/sai-qx-student-client/apps/mobile/src/a.ts` 得到 `@sai-qx-student-client/apps/mobile/src/a.ts`。把该设置改成不存在的目录，确认不 spawn PTY、不启动 bridge 并出现明确错误。
 24. 在已在 OpenCode 中 `/cd D:/Workspace/FR` 的现有会话执行 **OpenCode: 设置引用基准目录（不执行 cd）** 并选择 FR：确认命令没有向 PTY 写入、没有重启、截图/状态区分“引用基准”和“spawn cwd”，之后的引用按 FR 生成相对路径；执行 `/cd` 仍由用户自己完成。重启 PTY 或移除工作区后确认 override 失效并恢复启动目录。
+25. 打开单 root 的 `.code-workspace`：首次打开面板应只出现原生目录选择框，不出现项目 Quick Pick；选择 `D:/Workspace/FR` 后确认 spawn cwd 为该目录，顶部按钮显示 `工作目录：FR`，tooltip 同时显示完整路径和 owner 项目，拖入 FR 下文件生成 `@project/...`。取消目录框时确认没有 spawn、没有 bridge、没有新记忆。
+26. 打开多 root 窗口重复上一步，确认 owner/session key 固定为第一个 folder，切换目录按钮仍可用；重启 PTY 不再重复弹目录框。重启扩展宿主后再次打开面板，确认已记忆目录被复用。
+27. 在活跃 PTY 下点击“工作目录”选择新目录：确认先出现“将结束当前会话并重启”的确认；取消后旧 PTY 不受影响，确认后只弹一次目录框且新会话 cwd 正确。若 `opencodeTerminal.workingDirectory` 显式存在，确认点击按钮只提示设置优先，不打开目录框也不 kill 会话。
+28. 打开没有工作区文件夹的 `.code-workspace`，确认不会 spawn 并提示先添加工作区文件夹。
+29. 正常启动或复用 PTY、添加引用、复制、设置引用基准、取消目录选择后，确认右上角**不再出现成功浮层**；必要状态可在顶部 shell 状态/工作目录按钮的 tooltip 中查看。
+30. 修改默认 shell 或工作目录设置后，确认只有“重启”按钮出现轻量标记和 tooltip 说明，不弹 notice 浮层；重启后标记消失。
+31. 制造一次真实错误（例如拖入无法识别的数据或未启动 PTY 时添加引用），确认错误浮层出现、最多约 6 秒自动消失，且关闭按钮可点击；关闭后同一事件不会因状态刷新再次弹出，重复同一操作产生的新错误仍可显示。
+32. 隐藏再打开面板或重建 webview，确认旧错误不会回放；同时确认 OpenCode TUI 自身的 toast/提示仍由上游控制，扩展没有拦截或修改 `cli.json`。

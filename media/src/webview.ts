@@ -10,8 +10,11 @@ import { FitAddon } from '@xterm/addon-fit';
 import { Terminal } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import {
+  NotificationController,
   TerminalFitDebouncer,
   applyTerminalKey,
+  stateErrorNotice,
+  workspaceButtonView,
 } from './interaction';
 import './webview.css';
 
@@ -25,6 +28,10 @@ interface StateMessage {
   readonly type: 'state';
   readonly workspaceName?: unknown;
   readonly workspaceCount?: unknown;
+  readonly workspaceKey?: unknown;
+  readonly workspaceMode?: unknown;
+  readonly workingDirectory?: unknown;
+  readonly workingDirectorySource?: unknown;
   readonly shellLabel?: unknown;
   readonly shellWarnings?: unknown;
   readonly status?: unknown;
@@ -37,7 +44,10 @@ interface StateMessage {
 
 interface SnapshotMessage {
   readonly type: 'ptySnapshot';
+  readonly workspaceName?: unknown;
   readonly folderName?: unknown;
+  readonly workspaceMode?: unknown;
+  readonly workingDirectory?: unknown;
   readonly shellLabel?: unknown;
   readonly session?: unknown;
   readonly truncated?: unknown;
@@ -58,6 +68,8 @@ const workspaceName = document.getElementById('workspace-name') as HTMLSpanEleme
 const shellLabel = document.getElementById('shell-label') as HTMLSpanElement;
 const restartButton = document.getElementById('restart-button') as HTMLButtonElement;
 const noticeEl = document.getElementById('notice') as HTMLDivElement;
+const noticeTextEl = document.getElementById('notice-text') as HTMLSpanElement;
+const noticeClose = document.getElementById('notice-close') as HTMLButtonElement;
 const appEl = document.getElementById('app') as HTMLDivElement;
 const terminalWrap = document.getElementById('terminal-wrap') as HTMLElement;
 const terminalEl = document.getElementById('terminal') as HTMLDivElement;
@@ -71,27 +83,72 @@ function text(value: unknown): string {
   return typeof value === 'string' ? value : '';
 }
 
-function showNotice(
-  message: string,
-  kind: 'info' | 'error' = 'info',
-  timeoutMs = 8000,
-): void {
-  noticeEl.textContent = message;
-  noticeEl.className = `notice ${kind}`;
-  noticeEl.hidden = false;
-  if (timeoutMs > 0) {
-    window.setTimeout(() => {
-      if (noticeEl.textContent === message) {
-        noticeEl.hidden = true;
-      }
-    }, timeoutMs);
-  }
+interface PersistedWebviewState {
+  readonly lastNoticeEpoch?: unknown;
+  readonly lastNoticeId?: unknown;
 }
 
-function hideNotice(): void {
-  noticeEl.hidden = true;
-  noticeEl.textContent = '';
+function readPersistedNoticeEpoch(): string {
+  const state = vscode.getState() as PersistedWebviewState | null | undefined;
+  if (state !== null && typeof state === 'object') {
+    const value = state.lastNoticeEpoch;
+    if (typeof value === 'string' && value.length > 0) {
+      return value;
+    }
+  }
+  return '';
 }
+
+function readPersistedNoticeId(): number {
+  const state = vscode.getState() as PersistedWebviewState | null | undefined;
+  if (state !== null && typeof state === 'object') {
+    const value = state.lastNoticeId;
+    if (Number.isSafeInteger(value) && (value as number) > 0) {
+      return value as number;
+    }
+  }
+  return 0;
+}
+
+function persistNoticeId(): void {
+  const current = vscode.getState();
+  const base =
+    current !== null && typeof current === 'object'
+      ? (current as Record<string, unknown>)
+      : {};
+  vscode.setState({
+    ...base,
+    lastNoticeEpoch: notification.lastNoticeEpoch,
+    lastNoticeId: notification.lastNoticeId,
+  });
+}
+
+function renderNotice(message: string): void {
+  noticeTextEl.textContent = message;
+  noticeEl.className = 'notice error';
+  noticeEl.hidden = false;
+}
+
+function clearNotice(): void {
+  noticeEl.hidden = true;
+  noticeTextEl.textContent = '';
+  noticeEl.className = 'notice';
+}
+
+const notification = new NotificationController({
+  scheduler: {
+    setTimeout(callback, delayMs) {
+      return window.setTimeout(callback, delayMs);
+    },
+    clearTimeout(handle) {
+      window.clearTimeout(handle as number);
+    },
+  },
+  render: renderNotice,
+  clear: clearNotice,
+  initialLastNoticeEpoch: readPersistedNoticeEpoch(),
+  initialLastNoticeId: readPersistedNoticeId(),
+});
 
 const terminal = new Terminal({
   convertEol: false,
@@ -115,6 +172,46 @@ let outputReady = false;
 let pendingOutput: OutputChunk[] = [];
 let resyncPending = false;
 let dragDepth = 0;
+let workspaceMode = false;
+let ownerName = '';
+let workingDirectory = '';
+let workspaceCount = 0;
+let workspaceTrusted = false;
+let shellStatusTitle = '当前 shell';
+let shellWarningsTitle = '';
+let toolbarNote = '';
+
+function renderShellLabelTitle(): void {
+  const parts = [shellStatusTitle, shellWarningsTitle, toolbarNote].filter(
+    (part) => part.length > 0,
+  );
+  shellLabel.title = parts.length > 0 ? parts.join('\n') : '当前 shell';
+}
+
+function renderWorkspaceButton(): void {
+  const view = workspaceButtonView({
+    workspaceMode,
+    ownerName,
+    workingDirectory,
+    workspaceCount,
+    trusted: workspaceTrusted,
+  });
+  workspaceName.textContent = view.label;
+  workspaceButton.title = view.title;
+  workspaceButton.disabled = view.disabled;
+}
+
+/** Applies state/snapshot fields without ever treating the owner as cwd. */
+function applyWorkspaceState(
+  workspaceModeValue: unknown,
+  ownerValue: unknown,
+  cwdValue: unknown,
+): void {
+  workspaceMode = workspaceModeValue === true;
+  ownerName = text(ownerValue);
+  workingDirectory = text(cwdValue);
+  renderWorkspaceButton();
+}
 
 function cssValue(name: string, fallback: string): string {
   const styles = getComputedStyle(document.body);
@@ -209,6 +306,8 @@ function handleWindowResize(): void {
 window.addEventListener('resize', handleWindowResize);
 
 window.addEventListener('pagehide', () => {
+  notification.dispose();
+  persistNoticeId();
   fitDebouncer.dispose();
   resizeObserver.disconnect();
   themeObserver.disconnect();
@@ -314,9 +413,11 @@ function handleSnapshot(message: SnapshotMessage): void {
   terminal.reset();
   terminal.clear();
 
-  if (text(message.folderName).length > 0) {
-    workspaceName.textContent = text(message.folderName);
-  }
+  applyWorkspaceState(
+    message.workspaceMode,
+    message.workspaceName ?? message.folderName,
+    message.workingDirectory,
+  );
   if (text(message.shellLabel).length > 0) {
     shellLabel.textContent = text(message.shellLabel);
   }
@@ -339,9 +440,11 @@ function handleSnapshot(message: SnapshotMessage): void {
     }
   }
 
-  if (message.truncated === true) {
-    showNotice('PTY 输出缓冲已截断；较早的屏幕内容无法恢复。', 'info', 10000);
-  }
+  toolbarNote =
+    message.truncated === true
+      ? 'PTY 输出缓冲已截断；较早的屏幕内容无法恢复。'
+      : '';
+  renderShellLabelTitle();
   if (sessionId !== null) {
     terminal.focus();
   }
@@ -380,40 +483,40 @@ function handleState(message: StateMessage): void {
   const trusted = message.trusted === true;
   const ptyActive = message.ptyActive === true;
 
-  workspaceName.textContent = text(message.workspaceName) || '工作区';
-  workspaceButton.disabled = count < 2 || !trusted;
-  workspaceButton.title =
-    count < 2 ? '当前工作区' : '切换工作区';
+  workspaceCount = count;
+  workspaceTrusted = trusted;
+  applyWorkspaceState(
+    message.workspaceMode,
+    message.workspaceName,
+    message.workingDirectory,
+  );
   shellLabel.textContent = text(message.shellLabel) || 'shell';
-  shellLabel.title =
+  shellStatusTitle =
     text(message.status).length > 0 ? text(message.status) : '当前 shell';
 
   restartButton.disabled = !trusted;
+  const restartRecommended = message.restartRecommended === true;
+  restartButton.classList.toggle('restart-recommended', restartRecommended);
+  restartButton.title = restartRecommended
+    ? '终端或工作目录配置已更改，重启 PTY 后生效。'
+    : '重启 PTY';
 
   if (!ptyActive && sessionId !== null) {
     resetStream();
   }
 
-  if (message.notice !== null && typeof message.notice === 'object') {
-    const notice = message.notice as Record<string, unknown>;
-    const noticeText = text(notice.message);
-    if (noticeText.length > 0) {
-      showNotice(noticeText, notice.kind === 'error' ? 'error' : 'info');
-    }
-  } else if (message.restartRecommended === true) {
-    showNotice(text(message.status), 'info', 10000);
-  } else if (text(message.status).length > 0 && sessionId === null) {
-    showNotice(text(message.status), 'info', 0);
-  } else {
-    hideNotice();
+  // Only a real error uses the overlay. Info notices, status text and the
+  // restart hint stay in the toolbar; a visible error is never hidden just
+  // because a later state carries an info notice.
+  if (notification.handleHostNotice(stateErrorNotice(message))) {
+    persistNoticeId();
   }
 
   const warnings = Array.isArray(message.shellWarnings)
     ? message.shellWarnings.filter((entry): entry is string => typeof entry === 'string')
     : [];
-  if (warnings.length > 0) {
-    shellLabel.title = warnings.join('\n');
-  }
+  shellWarningsTitle = warnings.length > 0 ? warnings.join('\n') : '';
+  renderShellLabelTitle();
 }
 
 window.addEventListener('message', (event) => {
@@ -436,10 +539,8 @@ window.addEventListener('message', (event) => {
       const exitSession = (message as { sessionId?: unknown }).sessionId;
       if (typeof exitSession === 'string' && exitSession === sessionId) {
         resetStream();
-        showNotice(
+        notification.showLocalError(
           'PTY 已退出。引用不会写入 shell；请点击“重启”。',
-          'error',
-          0,
         );
       }
       return;
@@ -461,6 +562,11 @@ workspaceButton.addEventListener('click', () => {
 
 restartButton.addEventListener('click', () => {
   post({ type: 'restart' });
+});
+
+noticeClose.addEventListener('click', () => {
+  notification.dismiss();
+  persistNoticeId();
 });
 
 function readData(dataTransfer: DataTransfer, type: string): string {
@@ -567,7 +673,7 @@ document.addEventListener(
 
     const dataTransfer = event.dataTransfer;
     if (dataTransfer === null) {
-      showNotice('拖放数据为空，未写入引用。', 'error');
+      notification.showLocalError('拖放数据为空，未写入引用。');
       return;
     }
     const payload = collectDrop(dataTransfer);
@@ -578,11 +684,10 @@ document.addEventListener(
       } catch {
         fileCount = 0;
       }
-      showNotice(
+      notification.showLocalError(
         fileCount > 0
           ? '系统文件管理器拖入的文件没有暴露本地路径（VS Code webview 限制）。请拖到底部面板中 TUI 左侧的“拖入文件”原生区域，或使用命令面板的“OpenCode: 选择文件插入 @ 引用”。'
           : '未识别到文件或选区。请把文件拖到底部面板中 TUI 左侧的“拖入文件”原生区域；webview 内的 Explorer 拖放受 VS Code 平台限制，不保证可用。不要拖入任意纯文本。',
-        'error',
       );
       return;
     }

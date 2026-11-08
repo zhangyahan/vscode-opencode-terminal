@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -51,11 +51,16 @@ import {
   withEditorBridgeEnvironment,
   withTerminalEnvironment,
 } from './terminalConfig';
-import { resolveWorkingDirectory } from './workingDirectory';
+import {
+  isWorkspaceMode,
+  resolveWorkingDirectory,
+} from './workingDirectory';
 
 const VIEW_ID = 'opencodeTerminal.main';
 const CONFIG_SECTION = 'opencodeTerminal';
 const STATE_LAST_FOLDER = 'opencodeTerminal.lastFolder.v1';
+const STATE_CHOSEN_WORKING_DIRECTORIES =
+  'opencodeTerminal.chosenWorkingDirectories.v1';
 const OUTPUT_BATCH_MS = 8;
 const MAX_OUTPUT_BATCH_CHARS = 64 * 1024;
 
@@ -71,6 +76,10 @@ interface ShellRuntimeInfo {
 interface Notice {
   readonly kind: 'info' | 'error';
   readonly message: string;
+  /** Random per provider activation; a restarted host starts a new epoch. */
+  readonly epoch: string;
+  /** Monotonic within one epoch; the webview uses it to ignore replays. */
+  readonly id: number;
 }
 
 interface OutputBatch {
@@ -102,6 +111,26 @@ interface ReferenceBaseOverride {
   readonly basePath: string;
 }
 
+type WorkingDirectorySource = 'configured' | 'chosen' | 'owner';
+
+interface LaunchDirectory {
+  readonly path: string;
+  readonly source: WorkingDirectorySource;
+}
+
+type LaunchDirectoryResult =
+  | ({ readonly ok: true } & LaunchDirectory)
+  | { readonly ok: false; readonly reason: 'cancelled' | 'invalid' };
+
+type PickWorkingDirectoryResult =
+  | { readonly ok: true; readonly path: string }
+  | { readonly ok: false; readonly reason: 'cancelled' | 'invalid' };
+
+interface DisplayWorkingDirectory {
+  readonly path: string | undefined;
+  readonly source: WorkingDirectorySource | undefined;
+}
+
 class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
   private view: vscode.WebviewView | undefined;
   private selectionCache: readonly SelectionSnapshot[] = [];
@@ -111,6 +140,9 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
   private readonly shellByFolder = new Map<string, ShellRuntimeInfo>();
   private readonly workspaceConfigChoices = new Map<string, WorkspaceConfigChoice>();
   private notice: Notice | undefined;
+  /** Fresh on every provider activation; never derived from wall clock. */
+  private readonly noticeEpoch = randomUUID();
+  private noticeSerial = 0;
   private autoStartAttempted = false;
   private restartRecommended = false;
   private lastMentionText: string | undefined;
@@ -132,6 +164,13 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
   private readonly statDirectory: (fsPath: string) => Promise<boolean>;
   /** In-memory only; cleared when its session ends or the folder is removed. */
   private readonly referenceBaseOverrides = new Map<string, ReferenceBaseOverride>();
+  /**
+   * Workspace-mode choices keyed by workspace file + owner folder. These are
+   * persisted so a later panel/extension host can reuse the same real cwd.
+   */
+  private readonly chosenWorkingDirectories = new Map<string, string>();
+  /** Last successfully resolved launch directory for UI state (never guessed). */
+  private readonly launchDirectories = new Map<string, LaunchDirectory>();
   private disposed = false;
 
   constructor(
@@ -142,6 +181,20 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
     const savedFolder = context.workspaceState.get<string>(STATE_LAST_FOLDER);
     if (typeof savedFolder === 'string') {
       this.lastFolderKey = savedFolder;
+    }
+    const savedChoices = context.workspaceState.get<unknown>(
+      STATE_CHOSEN_WORKING_DIRECTORIES,
+    );
+    if (
+      savedChoices !== null &&
+      typeof savedChoices === 'object' &&
+      !Array.isArray(savedChoices)
+    ) {
+      for (const [namespace, value] of Object.entries(savedChoices)) {
+        if (typeof value === 'string' && value.length > 0) {
+          this.chosenWorkingDirectories.set(namespace, value);
+        }
+      }
     }
 
     this.createEditorBridge =
@@ -541,18 +594,17 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
       sessionId: snapshot.sessionId,
       basePath,
     });
-    this.notice = {
-      kind: 'info',
-      message:
-        `已为当前 PTY 会话设置引用基准：${basePath}。` +
+    this.setNotice(
+      'info',
+      `已为当前 PTY 会话设置引用基准：${basePath}。` +
         '只影响之后的 @ 引用；请确保与你在 OpenCode 中 /cd 后的目录相同，扩展未执行 cd；' +
         '重启 PTY 后恢复启动目录。',
-    };
+    );
     this.postState();
   }
 
   clearTerminal(): void {
-    this.notice = { kind: 'info', message: '已清除 xterm 滚动缓冲；没有向 PTY 发送内容。' };
+    this.setNotice('info', '已清除 xterm 滚动缓冲；没有向 PTY 发送内容。');
     this.postMessage({ type: 'clearTerminal' });
     this.postState();
   }
@@ -656,12 +708,7 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
       return;
     }
 
-    let folder: vscode.WorkspaceFolder | undefined;
-    if (folders.length === 1) {
-      folder = folders[0];
-    } else {
-      folder = await this.chooseFolder('选择首次运行 OpenCode 的工作区');
-    }
+    const folder = this.ownerFolder();
     if (folder === undefined || this.view === undefined) {
       this.postState();
       return;
@@ -678,9 +725,9 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
     }
     this.reconcileActiveFolder();
     if (this.activeFolderKey === undefined) {
-      const folders = vscode.workspace.workspaceFolders ?? [];
-      if (folders.length === 1 && vscode.workspace.isTrusted) {
-        this.activeFolderKey = folders[0].uri.toString();
+      const owner = this.ownerFolder();
+      if (owner !== undefined && vscode.workspace.isTrusted) {
+        this.activeFolderKey = owner.uri.toString();
       }
     }
 
@@ -715,6 +762,7 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
     const snapshot =
       folderKey === undefined ? undefined : this.pty.snapshot(folderKey);
     const shell = folderKey === undefined ? undefined : this.shellByFolder.get(folderKey);
+    const workingDirectory = this.displayWorkingDirectory(folder);
 
     this.attached = true;
     this.streamSessionId = snapshot?.sessionId;
@@ -725,7 +773,11 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
     this.postMessage({
       type: 'ptySnapshot',
       workspaceKey: folderKey ?? null,
+      workspaceName: folder?.name ?? null,
       folderName: folder?.name ?? null,
+      workspaceMode: this.workspaceMode(),
+      workingDirectory: workingDirectory.path ?? null,
+      workingDirectorySource: workingDirectory.source ?? null,
       shellLabel: shell?.label ?? null,
       session: snapshot ?? null,
       truncated: snapshot?.truncated === true,
@@ -741,6 +793,8 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
       readonly restart: boolean;
       readonly cols?: number;
       readonly rows?: number;
+      /** Directory already chosen/confirmed by the user for this launch. */
+      readonly workingDirectory?: string;
     },
   ): Promise<void> {
     this.notice = undefined;
@@ -748,9 +802,6 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
       this.reportError('当前工作区处于限制模式，已禁止启动 PTY。');
       return;
     }
-
-    const folderKey = folder.uri.toString();
-    this.setActiveFolder(folder);
 
     const configuration = vscode.workspace.getConfiguration(
       CONFIG_SECTION,
@@ -763,33 +814,44 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
       return;
     }
 
-    const workingDirectory = resolveWorkingDirectory({
-      value: configuration.get<unknown>('workingDirectory', ''),
-      workspacePath: folder.uri.fsPath,
-      userHome: os.homedir(),
-      platform: process.platform,
-    });
-    if (!workingDirectory.ok) {
-      this.reportError(
-        `OpenCode 工作目录设置无效：${workingDirectory.message}`,
-      );
-      return;
-    }
-    if (!(await this.statDirectory(workingDirectory.path))) {
-      this.reportError(
-        `OpenCode 工作目录不存在或不是文件夹：${workingDirectory.path}。未启动 PTY。`,
-      );
+    const launch = await this.resolveLaunchDirectory(
+      folder,
+      options.workingDirectory,
+    );
+    if (!launch.ok) {
+      if (launch.reason === 'cancelled') {
+        this.setNotice('info', '已取消选择工作目录；未启动 PTY。');
+      }
+      this.postState();
       return;
     }
     if (this.disposed) {
       return;
     }
 
-    const shell = await this.resolveShell(folder, workingDirectory.path);
+    const shell = await this.resolveShell(folder, launch.path);
     if (shell === undefined) {
       this.postState();
       return;
     }
+    if (this.disposed) {
+      return;
+    }
+
+    // The workspace owner is only a session/config namespace. The spawn cwd
+    // above is the real user-selected directory and is never a fake folder.
+    const owner = this.ownerFolder();
+    if (owner === undefined || owner.uri.toString() !== folder.uri.toString()) {
+      this.reportError('工作区已变化，未启动 PTY；请重新选择工作目录。');
+      return;
+    }
+
+    const folderKey = folder.uri.toString();
+    this.setActiveFolder(folder);
+    this.launchDirectories.set(folderKey, {
+      path: shell.cwd,
+      source: launch.source,
+    });
 
     if (options.restart) {
       this.pty.stop(folderKey);
@@ -851,20 +913,32 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
     this.restartRecommended = false;
     if (result.created) {
       this.shellByFolder.set(folderKey, shellInfo(shell));
-      this.notice = {
-        kind: 'info',
-        message:
-          `已在 ${folder.name} 启动 PTY 并执行配置的启动命令（未验证 OpenCode 是否已进入前台）。` +
-          `工作目录：${shell.cwd}。`,
-      };
+      this.launchDirectories.set(folderKey, {
+        path: shell.cwd,
+        source: launch.source,
+      });
+      this.setNotice(
+        'info',
+        this.workspaceMode()
+          ? `已在项目“${folder.name}”的工作目录 ${shell.cwd} 启动 PTY 并执行配置的启动命令（未验证 OpenCode 是否已进入前台）。`
+          : `已在 ${folder.name} 启动 PTY 并执行配置的启动命令（未验证 OpenCode 是否已进入前台）。工作目录：${shell.cwd}。`,
+      );
     } else {
       if (!this.shellByFolder.has(folderKey)) {
         this.shellByFolder.set(folderKey, shellInfo(shell));
       }
-      this.notice = {
-        kind: 'info',
-        message: `已复用 ${folder.name} 的现有 PTY；没有重复发送启动命令。`,
-      };
+      const runningCwd =
+        this.pty.getWorkingDirectory(folderKey, result.session.sessionId) ??
+        shell.cwd;
+      this.launchDirectories.set(folderKey, {
+        path: runningCwd,
+        source: launch.source,
+      });
+      this.setNotice(
+        'info',
+        `已复用 ${folder.name} 的现有 PTY（工作目录：${runningCwd}）；` +
+          '没有重复发送启动命令。',
+      );
     }
 
     if (this.view !== undefined) {
@@ -872,6 +946,209 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
     } else {
       this.postState();
     }
+  }
+
+  /**
+   * Resolves the real PTY cwd before any process/bridge starts.
+   *
+   * Priority: an explicit `opencodeTerminal.workingDirectory` setting, then a
+   * user-confirmed override for this launch, then (workspace mode only) the
+   * remembered choice or a native folder picker. A normal single-folder
+   * workspace keeps using its root. Cancellation/invalid choices never fall
+   * back to the project root and never write remembered state.
+   */
+  private async resolveLaunchDirectory(
+    folder: vscode.WorkspaceFolder,
+    confirmedWorkingDirectory?: string,
+  ): Promise<LaunchDirectoryResult> {
+    const configured = this.configuredWorkingDirectory(folder);
+    if (!configured.ok) {
+      this.reportError(
+        `OpenCode 工作目录设置无效：${configured.message}`,
+      );
+      return { ok: false, reason: 'invalid' };
+    }
+    if (configured.source === 'configured') {
+      if (!(await this.statDirectory(configured.path))) {
+        this.reportError(
+          `OpenCode 工作目录不存在或不是文件夹：${configured.path}。未启动 PTY。`,
+        );
+        return { ok: false, reason: 'invalid' };
+      }
+      return { ok: true, path: configured.path, source: 'configured' };
+    }
+
+    if (confirmedWorkingDirectory !== undefined) {
+      if (!(await this.statDirectory(confirmedWorkingDirectory))) {
+        this.reportError(
+          `OpenCode 工作目录不存在或不是文件夹：${confirmedWorkingDirectory}。未启动 PTY。`,
+        );
+        return { ok: false, reason: 'invalid' };
+      }
+      return {
+        ok: true,
+        path: confirmedWorkingDirectory,
+        source: 'chosen',
+      };
+    }
+
+    if (!this.workspaceMode()) {
+      if (!(await this.statDirectory(folder.uri.fsPath))) {
+        this.reportError(
+          `OpenCode 工作目录不存在或不是文件夹：${folder.uri.fsPath}。未启动 PTY。`,
+        );
+        return { ok: false, reason: 'invalid' };
+      }
+      return { ok: true, path: folder.uri.fsPath, source: 'owner' };
+    }
+
+    const folderKey = folder.uri.toString();
+    const remembered = this.rememberedWorkingDirectory(folderKey);
+    if (remembered !== undefined) {
+      if (await this.statDirectory(remembered)) {
+        return { ok: true, path: remembered, source: 'chosen' };
+      }
+      this.setNotice(
+        'info',
+        `已保存的工作目录不存在或不是文件夹：${remembered}。请重新选择。`,
+      );
+    }
+
+    const picked = await this.pickWorkingDirectory(
+      vscode.Uri.file(folder.uri.fsPath),
+    );
+    if (!picked.ok) {
+      return picked;
+    }
+    await this.rememberWorkingDirectory(folderKey, picked.path);
+    return { ok: true, path: picked.path, source: 'chosen' };
+  }
+  private async pickWorkingDirectory(
+    defaultUri: vscode.Uri,
+  ): Promise<PickWorkingDirectoryResult> {
+    let picked: readonly vscode.Uri[] | undefined;
+    try {
+      picked = await vscode.window.showOpenDialog({
+        canSelectFiles: false,
+        canSelectFolders: true,
+        canSelectMany: false,
+        openLabel: '选择工作目录',
+        title: '选择 OpenCode 的实际工作目录（不是项目根）',
+        defaultUri,
+      });
+    } catch (error) {
+      this.reportError(`无法选择工作目录：${toErrorMessage(error)}`);
+      return { ok: false, reason: 'invalid' };
+    }
+    if (picked === undefined || picked.length === 0) {
+      return { ok: false, reason: 'cancelled' };
+    }
+
+    const selected = picked[0];
+    if (selected.scheme !== 'file') {
+      this.reportError('OpenCode 工作目录必须是本地文件夹。');
+      return { ok: false, reason: 'invalid' };
+    }
+    const selectedPath = selected.fsPath;
+    if (!(await this.statDirectory(selectedPath))) {
+      this.reportError(
+        `OpenCode 工作目录不存在或不是文件夹：${selectedPath}。未启动 PTY。`,
+      );
+      return { ok: false, reason: 'invalid' };
+    }
+    return { ok: true, path: selectedPath };
+  }
+
+  private configuredWorkingDirectory(
+    folder: vscode.WorkspaceFolder,
+  ):
+    | { readonly ok: true; readonly path: string; readonly source: 'workspace' | 'configured' }
+    | { readonly ok: false; readonly message: string } {
+    const configuration = vscode.workspace.getConfiguration(
+      CONFIG_SECTION,
+      folder.uri,
+    );
+    const resolved = resolveWorkingDirectory({
+      value: configuration.get<unknown>('workingDirectory', ''),
+      workspacePath: folder.uri.fsPath,
+      userHome: os.homedir(),
+      platform: process.platform,
+    });
+    return resolved.ok
+      ? { ok: true, path: resolved.path, source: resolved.source }
+      : { ok: false, message: resolved.message };
+  }
+
+  private workspaceMode(): boolean {
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    return isWorkspaceMode(vscode.workspace.workspaceFile, folders.length);
+  }
+
+  private workingDirectoryNamespace(folderKey: string): string {
+    const workspaceFile = vscode.workspace.workspaceFile;
+    return `${workspaceFile?.toString() ?? 'folder'}|${folderKey}`;
+  }
+
+  private rememberedWorkingDirectory(folderKey: string): string | undefined {
+    return this.chosenWorkingDirectories.get(
+      this.workingDirectoryNamespace(folderKey),
+    );
+  }
+
+  private async rememberWorkingDirectory(
+    folderKey: string,
+    path: string,
+  ): Promise<void> {
+    const namespace = this.workingDirectoryNamespace(folderKey);
+    if (this.chosenWorkingDirectories.get(namespace) === path) {
+      return;
+    }
+    this.chosenWorkingDirectories.set(namespace, path);
+    await this.context.workspaceState.update(
+      STATE_CHOSEN_WORKING_DIRECTORIES,
+      Object.fromEntries(this.chosenWorkingDirectories),
+    );
+  }
+
+  private forgetWorkingDirectory(folderKey: string): void {
+    if (this.chosenWorkingDirectories.delete(this.workingDirectoryNamespace(folderKey))) {
+      void this.context.workspaceState.update(
+        STATE_CHOSEN_WORKING_DIRECTORIES,
+        Object.fromEntries(this.chosenWorkingDirectories),
+      );
+    }
+  }
+
+  private displayWorkingDirectory(
+    folder: vscode.WorkspaceFolder | undefined,
+  ): DisplayWorkingDirectory {
+    if (folder === undefined) {
+      return { path: undefined, source: undefined };
+    }
+    const folderKey = folder.uri.toString();
+    const snapshot = this.pty.snapshot(folderKey);
+    if (snapshot !== undefined) {
+      const spawnPath = this.pty.getWorkingDirectory(
+        folderKey,
+        snapshot.sessionId,
+      );
+      if (spawnPath !== undefined) {
+        return {
+          path: spawnPath,
+          source: this.launchDirectories.get(folderKey)?.source,
+        };
+      }
+    }
+    const launch = this.launchDirectories.get(folderKey);
+    if (launch !== undefined) {
+      return launch;
+    }
+    if (this.workspaceMode()) {
+      // A remembered path must be stat-validated by the async launch flow;
+      // never show an unverified saved path as the current working directory.
+      return { path: undefined, source: undefined };
+    }
+    return { path: folder.uri.fsPath, source: 'owner' };
   }
 
   private async ensureBridge(
@@ -1048,6 +1325,10 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
       this.reportError('当前工作区处于限制模式，已禁止启动 PTY。');
       return;
     }
+    if (this.workspaceMode()) {
+      await this.chooseWorkingDirectory();
+      return;
+    }
     const folder = await this.chooseFolder('切换 OpenCode 工作区');
     if (folder === undefined) {
       this.postState();
@@ -1060,6 +1341,95 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
     } else {
       this.sendSnapshot();
     }
+  }
+
+  /**
+   * Workspace mode entry point for the toolbar button. It always chooses the
+   * real working directory, not a project root. If a PTY is running the user
+   * must confirm that it will be ended before the new directory is saved and
+   * used for the replacement session.
+   */
+  private async chooseWorkingDirectory(): Promise<void> {
+    this.notice = undefined;
+    if (!vscode.workspace.isTrusted) {
+      this.reportError('当前工作区处于限制模式，已禁止切换工作目录。');
+      return;
+    }
+    const folder = this.ownerFolder();
+    if (folder === undefined) {
+      this.reportError(
+        vscode.workspace.workspaceFile !== undefined
+          ? '未打开工作区文件夹。请先在资源管理器中把文件夹添加到当前 .code-workspace。'
+          : '未打开工作区文件夹。',
+      );
+      return;
+    }
+
+    const configured = this.configuredWorkingDirectory(folder);
+    if (!configured.ok) {
+      this.reportError(`OpenCode 工作目录设置无效：${configured.message}`);
+      return;
+    }
+    if (configured.source === 'configured') {
+      this.setNotice(
+        'info',
+        `工作目录由设置 opencodeTerminal.workingDirectory 指定：${configured.path}。` +
+          '手动选择不会覆盖该设置；如需更换，请先在设置中修改或清空该项。',
+      );
+      this.postState();
+      return;
+    }
+
+    const current = this.displayWorkingDirectory(folder).path;
+    const picked = await this.pickWorkingDirectory(
+      vscode.Uri.file(current ?? folder.uri.fsPath),
+    );
+    if (!picked.ok) {
+      if (picked.reason === 'cancelled') {
+        this.postState();
+      }
+      return;
+    }
+
+    const folderKey = folder.uri.toString();
+    // The picker is async. Re-read the session so a PTY that started while the
+    // dialog was open is still protected by the confirmation.
+    const snapshot = this.pty.snapshot(folderKey);
+    if (snapshot !== undefined) {
+      const running =
+        this.pty.getWorkingDirectory(folderKey, snapshot.sessionId) ??
+        this.displayWorkingDirectory(folder).path ??
+        '未知';
+      const confirmed = await vscode.window.showWarningMessage(
+        '切换工作目录将结束当前 OpenCode 会话并用新目录重启。',
+        {
+          modal: true,
+          detail:
+            `当前工作目录：${running}\n` +
+            `新的工作目录：${picked.path}\n` +
+            '当前会话会被结束，未提交的输入或运行中的任务可能丢失。',
+        },
+        '结束会话并重启',
+        '取消',
+      );
+      if (confirmed !== '结束会话并重启') {
+        this.postState();
+        return;
+      }
+      if (this.disposed) {
+        return;
+      }
+    }
+
+    // Save only after a confirmed, valid selection and before starting.
+    await this.rememberWorkingDirectory(folderKey, picked.path);
+    if (this.disposed) {
+      return;
+    }
+    await this.startSession(folder, {
+      restart: snapshot !== undefined,
+      workingDirectory: picked.path,
+    });
   }
 
   private handlePtyInput(sessionId: string, data: string): void {
@@ -1297,14 +1667,17 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
 
   /**
    * Prefers a same-session manual override, then the actual spawn cwd recorded
-   * by the PTY manager. Without a session, falls back to the workspace folder
-   * so the existing "PTY 未运行" guard still reports the real state.
+   * by the PTY manager. Without a session, uses the resolved launch directory
+   * (workspace mode) or the workspace folder so the existing "PTY 未运行"
+   * guard still reports the real state.
    */
   private currentReferenceBase(folder: vscode.WorkspaceFolder): string {
     const folderKey = folder.uri.toString();
     const snapshot = this.pty.snapshot(folderKey);
     if (snapshot === undefined) {
-      return folder.uri.fsPath;
+      return (
+        this.displayWorkingDirectory(folder).path ?? folder.uri.fsPath
+      );
     }
     return this.referenceBase(folder, snapshot.sessionId);
   }
@@ -1319,7 +1692,9 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
       return override.basePath;
     }
     return (
-      this.pty.getWorkingDirectory(folderKey, sessionId) ?? folder.uri.fsPath
+      this.pty.getWorkingDirectory(folderKey, sessionId) ??
+      this.displayWorkingDirectory(folder).path ??
+      folder.uri.fsPath
     );
   }
 
@@ -1365,7 +1740,11 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
     }
 
     const folderKey = folder.uri.toString();
-    if (folderKey !== this.activeFolderKey) {
+    const activeFolder = this.activeFolder();
+    if (
+      activeFolder === undefined ||
+      activeFolder.uri.toString() !== folderKey
+    ) {
       this.reportError('该工作区不是当前活动 PTY。请切换工作区后再试。');
       return;
     }
@@ -1490,10 +1869,10 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
     if (problems.length > 0) {
       parts.push(`${problems.length} 项被忽略`);
     }
-    this.notice = {
-      kind: problems.length > 0 || unrepresentable > 0 ? 'error' : 'info',
-      message: `${parts.join('；')}。`,
-    };
+    this.setNotice(
+      problems.length > 0 || unrepresentable > 0 ? 'error' : 'info',
+      `${parts.join('；')}。`,
+    );
     this.postState();
   }
 
@@ -1511,7 +1890,7 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
       this.reportError(`复制失败：${toErrorMessage(error)}`);
       return;
     }
-    this.notice = { kind: 'info', message };
+    this.setNotice('info', message);
     this.postState();
   }
 
@@ -1655,7 +2034,7 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
   }
 
   private async requireActiveOrChooseFolder(
-    placeHolder: string,
+    _placeHolder: string,
   ): Promise<vscode.WorkspaceFolder | undefined> {
     if (!vscode.workspace.isTrusted) {
       this.reportError('当前工作区处于限制模式，已禁止启动 PTY 或写入。');
@@ -1663,18 +2042,31 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
     }
     const folders = vscode.workspace.workspaceFolders ?? [];
     if (folders.length === 0) {
-      this.reportError('未打开工作区。请先打开一个文件夹。');
+      this.reportError(
+        vscode.workspace.workspaceFile !== undefined
+          ? '未打开工作区文件夹。请先在资源管理器中把文件夹添加到当前 .code-workspace，再启动 OpenCode。'
+          : '未打开工作区。请先打开一个文件夹。',
+      );
       return undefined;
     }
-    const active = this.activeFolder();
-    if (active !== undefined) {
-      return active;
+    // Workspace mode never shows a project Quick Pick. The owner is always the
+    // first folder; the real cwd is resolved separately through a directory
+    // picker.
+    const owner = this.ownerFolder();
+    if (owner === undefined) {
+      this.reportError('未找到可用的工作区文件夹。');
     }
-    return this.chooseFolder(placeHolder);
+    return owner;
   }
 
-  private activeFolder(): vscode.WorkspaceFolder | undefined {
+  private ownerFolder(): vscode.WorkspaceFolder | undefined {
     const folders = vscode.workspace.workspaceFolders ?? [];
+    if (folders.length === 0) {
+      return undefined;
+    }
+    if (this.workspaceMode()) {
+      return folders[0];
+    }
     if (this.activeFolderKey !== undefined) {
       const found = folders.find(
         (folder) => folder.uri.toString() === this.activeFolderKey,
@@ -1684,6 +2076,10 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
       }
     }
     return folders.length === 1 ? folders[0] : undefined;
+  }
+
+  private activeFolder(): vscode.WorkspaceFolder | undefined {
+    return this.ownerFolder();
   }
 
   private activeFolderOrContaining(
@@ -1699,6 +2095,8 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
   private forgetFolder(folderKey: string): void {
     this.pty.stop(folderKey);
     this.referenceBaseOverrides.delete(folderKey);
+    this.launchDirectories.delete(folderKey);
+    this.forgetWorkingDirectory(folderKey);
     void this.stopBridge(folderKey);
     this.exitedFolders.delete(folderKey);
     this.shellByFolder.delete(folderKey);
@@ -1782,16 +2180,19 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
     }
 
     const folders = vscode.workspace.workspaceFolders ?? [];
+    const workspaceMode = this.workspaceMode();
     const folder = this.activeFolder();
     const folderKey = folder?.uri.toString();
     const snapshot =
       folderKey === undefined ? undefined : this.pty.snapshot(folderKey);
     const shell = folderKey === undefined ? undefined : this.shellByFolder.get(folderKey);
     const trusted = vscode.workspace.isTrusted;
+    const workingDirectory = this.displayWorkingDirectory(folder);
     const spawnWorkingDirectory =
       folderKey === undefined || snapshot === undefined
         ? undefined
-        : this.pty.getWorkingDirectory(folderKey, snapshot.sessionId);
+        : this.pty.getWorkingDirectory(folderKey, snapshot.sessionId) ??
+          workingDirectory.path;
     const override =
       folderKey === undefined
         ? undefined
@@ -1809,20 +2210,40 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
     if (!trusted) {
       status = '限制模式：不会启动 PTY，也不会向终端写入。';
     } else if (folders.length === 0) {
-      status = '未打开工作区。';
+      status =
+        vscode.workspace.workspaceFile !== undefined
+          ? '未打开工作区文件夹。.code-workspace 需要先添加至少一个工作区文件夹。'
+          : '未打开工作区。';
     } else if (folder === undefined) {
-      status = '请选择工作区。';
+      status = '未找到可用的工作区文件夹。';
     } else if (snapshot !== undefined) {
+      const ownerDescription = workspaceMode
+        ? `项目（owner）：${folder.name}；`
+        : '';
       const baseDescription = overrideActive
         ? `引用基准：${referenceBase}（仅本会话手动设置，未执行 cd；spawn cwd：${spawnWorkingDirectory ?? '未知'}）`
         : `引用基准：${referenceBase}（会话启动目录）`;
       status =
-        `PTY 运行中（${shell?.label ?? 'shell'}）。${baseDescription}。` +
-        '扩展无法判断 OpenCode 是否仍在前台。';
+        `PTY 运行中（${shell?.label ?? 'shell'}）。` +
+        ownerDescription +
+        `工作目录：${spawnWorkingDirectory ?? workingDirectory.path ?? '未知'}。` +
+        `${baseDescription}。扩展无法判断 OpenCode 是否仍在前台。`;
     } else if (this.exitedFolders.has(folderKey ?? '')) {
-      status = 'PTY 已退出。引用不会写入 shell；请点击“重启”。';
+      status =
+        'PTY 已退出。引用不会写入 shell；请点击“重启”。' +
+        (workingDirectory.path === undefined
+          ? ''
+          : `原工作目录：${workingDirectory.path}。`);
+    } else if (workspaceMode && workingDirectory.path === undefined) {
+      status =
+        '尚未选择实际工作目录。请点击左上角“工作目录”按钮选择目录后启动 PTY。';
     } else {
-      status = 'PTY 未启动。请点击“重启”或打开面板自动启动。';
+      status =
+        'PTY 未启动。' +
+        (workingDirectory.path === undefined
+          ? ''
+          : `工作目录：${workingDirectory.path}。`) +
+        '请点击“重启”或打开面板自动启动。';
     }
     if (this.restartRecommended) {
       status += ' 终端或工作目录配置已更改，重启 PTY 后生效。';
@@ -1833,13 +2254,16 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
       workspaceName: folder?.name ?? null,
       workspaceCount: folders.length,
       workspaceKey: folderKey ?? null,
+      workspaceMode,
+      workingDirectory: workingDirectory.path ?? null,
+      workingDirectorySource: workingDirectory.source ?? null,
+      spawnWorkingDirectory: spawnWorkingDirectory ?? null,
       shellLabel: shell?.label ?? null,
       shellWarnings: shell?.warnings ?? [],
       status,
       ptyActive: snapshot !== undefined,
       sessionId: snapshot?.sessionId ?? null,
       referenceBase: referenceBase ?? null,
-      spawnWorkingDirectory: spawnWorkingDirectory ?? null,
       referenceBaseOverride: overrideActive,
       trusted,
       restartRecommended: this.restartRecommended,
@@ -1847,8 +2271,18 @@ class OpenCodeViewProvider implements vscode.WebviewViewProvider, vscode.Disposa
     });
   }
 
+  private setNotice(kind: Notice['kind'], message: string): void {
+    this.noticeSerial += 1;
+    this.notice = {
+      kind,
+      message,
+      epoch: this.noticeEpoch,
+      id: this.noticeSerial,
+    };
+  }
+
   private reportError(message: string): void {
-    this.notice = { kind: 'error', message };
+    this.setNotice('error', message);
     this.postState();
     if (this.view === undefined) {
       void vscode.window.showErrorMessage(message);
@@ -2003,14 +2437,17 @@ function buildWebviewHtml(
 <body>
   <div id="app" class="app">
     <header class="toolbar">
-      <button id="workspace-button" class="workspace" type="button" title="切换工作区">
-        <span id="workspace-name">工作区</span>
+      <button id="workspace-button" class="workspace" type="button" title="选择工作目录">
+        <span id="workspace-name">工作目录</span>
       </button>
       <span id="shell-label" class="shell" title="当前 shell">shell</span>
       <span class="spacer"></span>
       <button id="restart-button" type="button" title="重启 PTY">重启</button>
     </header>
-    <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+    <div id="notice" class="notice error" role="status" aria-live="polite" hidden>
+      <span id="notice-text" class="notice-text"></span>
+      <button id="notice-close" class="notice-close" type="button" aria-label="关闭通知" title="关闭通知">×</button>
+    </div>
     <main id="terminal-wrap" class="terminal-wrap">
       <div id="terminal" class="terminal" aria-label="OpenCode 终端"></div>
     </main>

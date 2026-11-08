@@ -166,17 +166,17 @@ test('manifest requires VS Code 1.106 or newer', () => {
   assert.equal(manifest.devDependencies?.['@types/vscode'], '1.106.0');
 });
 
-test('version and packaging target 0.0.12 consistently', () => {
-  assert.equal(manifest.version, '0.0.12');
+test('version and packaging target 0.0.14 consistently', () => {
+  assert.equal(manifest.version, '0.0.14');
   assert.match(manifest.description, /bottom Panel/i);
   assert.doesNotMatch(manifest.description, /Secondary Sidebar/i);
-  assert.equal(lockfile.version, '0.0.12');
-  assert.equal(lockfile.packages['']?.version, '0.0.12');
+  assert.equal(lockfile.version, '0.0.14');
+  assert.equal(lockfile.packages['']?.version, '0.0.14');
   assert.equal(lockfile.packages['']?.engines?.vscode, '^1.106.0');
 
   const packageScript = manifest.scripts?.package ?? '';
-  assert.match(packageScript, /vscode-opencode-terminal-0\.0\.12-win32-x64\.vsix/);
-  assert.doesNotMatch(packageScript, /0\.0\.1[01]/);
+  assert.match(packageScript, /vscode-opencode-terminal-0\.0\.14-win32-x64\.vsix/);
+  assert.doesNotMatch(packageScript, /0\.0\.1[0123]/);
 });
 
 test('workingDirectory setting and setReferenceBase command are contributed', () => {

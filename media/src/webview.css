@@ -137,6 +137,9 @@ body {
   top: 36px;
   right: 8px;
   z-index: 10;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
   max-width: min(560px, calc(100% - 16px));
   padding: 6px 9px;
   border: 1px solid var(--vscode-inputValidation-infoBorder, var(--vscode-panel-border));
@@ -147,11 +150,40 @@ body {
   font-size: 12px;
   line-height: 1.4;
   white-space: pre-wrap;
+  pointer-events: none;
+}
+
+.notice-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.notice-close {
+  flex: 0 0 auto;
+  margin: -2px -3px 0 0;
+  padding: 0 3px;
+  border: 0;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--vscode-foreground);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.2;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.notice-close:hover {
+  background: var(--vscode-toolbar-hoverBackground, rgba(90, 93, 94, 0.31));
 }
 
 .notice.error {
   border-color: var(--vscode-inputValidation-errorBorder, #be1100);
   background: var(--vscode-inputValidation-errorBackground, var(--vscode-panel-background));
+}
+
+.toolbar button.restart-recommended {
+  border-color: var(--vscode-inputValidation-warningBorder, var(--vscode-focusBorder));
 }
 
 .notice[hidden],

@@ -244,6 +244,9 @@ interface HarnessOptions {
   readonly userProfileArgs?: readonly string[];
   readonly directories?: readonly string[];
   readonly invalidDirectories?: readonly string[];
+  readonly workspaceFile?: MockUri;
+  readonly folderPaths?: readonly string[];
+  readonly workspaceStateSeed?: Readonly<Record<string, unknown>>;
   readonly openDialogChoice?:
     | readonly MockUri[]
     | ((
@@ -279,7 +282,14 @@ interface Harness {
   readonly openDocuments: MockUri[];
   readonly clipboard: { value: string; reads: number };
   readonly dialogCalls: Array<Record<string, unknown>>;
+  readonly quickPickCalls: Array<{
+    readonly items: unknown;
+    readonly options: Record<string, unknown> | undefined;
+  }>;
+  readonly workspaceState: Map<string, unknown>;
+  readonly workspaceStateWrites: Array<{ readonly key: string; readonly value: unknown }>;
   setActiveEditor(editor: unknown): void;
+  setWarningChoice(value: string | undefined): void;
   resolveView(): { readonly html: string };
   sendMessage(message: unknown): void;
   addRoot(fsPath: string, name?: string): MockFolder;
@@ -307,9 +317,16 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     const uri = MockUri.file(fsPath);
     return { name, uri, fsPath: uri.fsPath };
   };
-  const folder = createFolder('C:/demo', 'demo');
+  const folderNames = options.folderPaths ?? ['C:/demo'];
+  const folder = createFolder(folderNames[0] ?? 'C:/demo', 'demo');
   const extensionUri = MockUri.file('C:/extension');
-  const workspaceState = new Map<string, unknown>();
+  const workspaceState = new Map<string, unknown>(
+    Object.entries(options.workspaceStateSeed ?? {}),
+  );
+  const workspaceStateWrites: Array<{
+    readonly key: string;
+    readonly value: unknown;
+  }> = [];
   const commands = new Map<string, (...args: unknown[]) => unknown>();
   const spawnCalls: SpawnCall[] = [];
   const processes: FakeProcess[] = [];
@@ -323,12 +340,26 @@ function makeHarness(options: HarnessOptions = {}): Harness {
   const openDocuments: MockUri[] = [];
   const clipboard = { value: '', reads: 0 };
   const dialogCalls: Array<Record<string, unknown>> = [];
+  const quickPickCalls: Harness['quickPickCalls'] = [];
   const folderChangeListeners = new Set<(event: unknown) => void>();
   const configurationChangeListeners = new Set<
     (event: { affectsConfiguration(section: string): boolean }) => void
   >();
   let workingDirectoryValue: unknown = options.workingDirectory ?? '';
-  let folders: MockFolder[] = [folder];
+  let warningChoice = options.warningChoice;
+  let folders: MockFolder[] = folderNames.map((fsPath, index) =>
+    index === 0
+      ? folder
+      : createFolder(
+          fsPath,
+          fsPath
+            .replace(/\\/g, '/')
+            .replace(/\/+$/, '')
+            .split('/')
+            .filter((part) => part.length > 0)
+            .at(-1) ?? fsPath,
+        ),
+  );
   let nextSession = 0;
   let messageHandler: ((message: unknown) => void) | undefined;
   let registeredProvider:
@@ -434,6 +465,9 @@ function makeHarness(options: HarnessOptions = {}): Harness {
       get workspaceFolders() {
         return folders;
       },
+      get workspaceFile() {
+        return options.workspaceFile;
+      },
       get isTrusted() {
         return trusted;
       },
@@ -516,10 +550,16 @@ function makeHarness(options: HarnessOptions = {}): Harness {
           ? await choice(dialogOptions)
           : choice;
       },
-      showQuickPick: async () => undefined,
+      showQuickPick: async (
+        items: unknown,
+        pickOptions?: Record<string, unknown>,
+      ) => {
+        quickPickCalls.push({ items, options: pickOptions });
+        return undefined;
+      },
       showWarningMessage: async (...args: unknown[]) => {
         warningCalls.push(args);
-        return options.warningChoice;
+        return warningChoice;
       },
       showInformationMessage: async () => undefined,
       showErrorMessage: async (message: string) => {
@@ -571,6 +611,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
         get: (key) => workspaceState.get(key),
         update: async (key, value) => {
           workspaceState.set(key, value);
+          workspaceStateWrites.push({ key, value });
         },
       },
     };
@@ -676,8 +717,14 @@ function makeHarness(options: HarnessOptions = {}): Harness {
       openDocuments,
       clipboard,
       dialogCalls,
+      quickPickCalls,
+      workspaceState,
+      workspaceStateWrites,
       setActiveEditor(editor: unknown) {
         activeEditor = editor;
+      },
+      setWarningChoice(value: string | undefined) {
+        warningChoice = value;
       },
       resolveView,
       sendMessage(message: unknown) {
@@ -867,6 +914,257 @@ test('auto-start spawns once with profile args/env/cwd, streams output, input, r
       process.env.ELECTRON_RUN_AS_NODE = previousElectron;
     }
   }
+});
+
+test('a normal single-folder workspace keeps the auto root without any picker', async () => {
+  const harness = makeHarness();
+  await startReady(harness);
+
+  assert.equal(harness.dialogCalls.length, 0, 'no folder dialog');
+  assert.equal(harness.quickPickCalls.length, 0, 'no project QuickPick');
+  assert.equal(harness.spawnCalls.length, 1);
+  assert.equal(harness.spawnCalls[0].options.cwd, harness.folder.fsPath);
+  const state = lastState(harness);
+  assert.equal(state.workspaceMode, false);
+  assert.equal(state.workspaceName, 'demo');
+  assert.equal(state.workingDirectory, harness.folder.fsPath);
+  assert.equal(state.workingDirectorySource, 'owner');
+});
+
+test('a single-root .code-workspace selects the real working directory and formats references from it', async () => {
+  const workspaceFile = MockUri.file('C:/workspaces/demo.code-workspace');
+  const harness = makeHarness({
+    workspaceFile,
+    directories: ['D:/Workspace/FR'],
+    openDialogChoice: [MockUri.file('D:/Workspace/FR')],
+  });
+  await startReady(harness);
+
+  assert.equal(harness.quickPickCalls.length, 0, 'workspace mode must not show a project QuickPick');
+  assert.equal(harness.dialogCalls.length, 1);
+  assert.equal(harness.dialogCalls[0].canSelectFolders, true);
+  assert.equal(harness.dialogCalls[0].canSelectFiles, false);
+  assert.equal(harness.dialogCalls[0].canSelectMany, false);
+  assert.equal(harness.spawnCalls.length, 1);
+  assert.equal(harness.spawnCalls[0].options.cwd, 'D:/Workspace/FR');
+
+  const state = lastState(harness);
+  assert.equal(state.workspaceMode, true);
+  assert.equal(state.workspaceKey, harness.folder.uri.toString());
+  assert.equal(state.workspaceName, 'demo', 'the owner remains the project folder');
+  assert.equal(state.workingDirectory, 'D:/Workspace/FR');
+  assert.equal(state.workingDirectorySource, 'chosen');
+  assert.equal(state.spawnWorkingDirectory, 'D:/Workspace/FR');
+  assert.match(String(state.status), /项目（owner）：demo/);
+  assert.match(String(state.status), /工作目录：D:\/Workspace\/FR/);
+
+  const saved = harness.workspaceState.get(
+    'opencodeTerminal.chosenWorkingDirectories.v1',
+  ) as Record<string, unknown>;
+  assert.equal(
+    saved[`${workspaceFile.toString()}|${harness.folder.uri.toString()}`],
+    'D:/Workspace/FR',
+    'the user choice must be remembered before the session starts',
+  );
+
+  await dropController(harness).handleDrop(
+    undefined,
+    nativeTransfer({
+      'text/uri-list': {
+        text:
+          'file:///D:/Workspace/FR/sai-qx-student-client/apps/mobile/src/a.ts',
+      },
+    }),
+    { isCancellationRequested: false },
+  );
+  await harness.waitFor(
+    () => harness.processes[0].writes.length === 2,
+    'workspace cwd reference write',
+  );
+  assert.equal(
+    harness.processes[0].writes[1],
+    '@sai-qx-student-client/apps/mobile/src/a.ts',
+    'references must be relative to the selected real cwd, not absolute',
+  );
+  assert.equal(harness.spawnCalls.length, 1);
+  assert.equal(
+    lastState(harness).workspaceKey,
+    harness.folder.uri.toString(),
+    'choosing a cwd must not create a virtual owner folder',
+  );
+});
+
+test('multi-root workspaces use the same directory picker without a project QuickPick', async () => {
+  const harness = makeHarness({
+    folderPaths: ['C:/demo', 'D:/other'],
+    directories: ['D:/Workspace/FR'],
+    openDialogChoice: [MockUri.file('D:/Workspace/FR')],
+  });
+  await startReady(harness);
+
+  assert.equal(harness.quickPickCalls.length, 0);
+  assert.equal(harness.dialogCalls.length, 1);
+  assert.equal(harness.spawnCalls.length, 1);
+  assert.equal(harness.spawnCalls[0].options.cwd, 'D:/Workspace/FR');
+  const state = lastState(harness);
+  assert.equal(state.workspaceMode, true);
+  assert.equal(state.workspaceKey, harness.folder.uri.toString());
+  assert.equal(state.workspaceName, 'demo');
+  assert.equal(state.workingDirectory, 'D:/Workspace/FR');
+});
+
+test('canceled working-directory selection spawns nothing and writes no workspace state', async () => {
+  const harness = makeHarness({
+    workspaceFile: MockUri.file('C:/workspaces/demo.code-workspace'),
+  });
+  harness.resolveView();
+  harness.sendMessage({ type: 'ready', cols: 100, rows: 30 });
+  await harness.waitFor(
+    () => harness.dialogCalls.length === 1,
+    'working-directory dialog',
+  );
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  assert.equal(harness.spawnCalls.length, 0);
+  assert.equal(harness.bridges.length, 0);
+  assert.equal(harness.quickPickCalls.length, 0);
+  assert.deepEqual(
+    harness.workspaceStateWrites,
+    [],
+    'canceling must not persist a remembered cwd or an active folder',
+  );
+});
+
+test('an explicit workingDirectory setting wins without a dialog in workspace mode, and manual switching explains the conflict', async () => {
+  const harness = makeHarness({
+    workspaceFile: MockUri.file('C:/workspaces/demo.code-workspace'),
+    workingDirectory: 'D:/Workspace/FR',
+    directories: ['D:/Workspace/FR'],
+  });
+  await startReady(harness);
+
+  assert.equal(harness.dialogCalls.length, 0);
+  assert.equal(harness.quickPickCalls.length, 0);
+  assert.equal(harness.spawnCalls[0].options.cwd, 'D:/Workspace/FR');
+  assert.equal(lastState(harness).workingDirectorySource, 'configured');
+
+  const kills = harness.processes[0].killCount;
+  harness.sendMessage({ type: 'chooseWorkspace' });
+  await harness.waitFor(
+    () => /工作目录由设置/.test(String(lastState(harness).notice?.message)),
+    'configured directory explanation',
+  );
+  assert.equal(harness.dialogCalls.length, 0, 'the setting must not be silently overridden');
+  assert.equal(harness.processes[0].killCount, kills);
+  assert.equal(harness.spawnCalls.length, 1);
+});
+
+test('restart reuses the remembered working directory without asking again', async () => {
+  const harness = makeHarness({
+    workspaceFile: MockUri.file('C:/workspaces/demo.code-workspace'),
+    directories: ['D:/Workspace/FR'],
+    openDialogChoice: [MockUri.file('D:/Workspace/FR')],
+  });
+  await startReady(harness);
+  assert.equal(harness.dialogCalls.length, 1);
+
+  harness.sendMessage({ type: 'restart' });
+  await harness.waitFor(() => harness.spawnCalls.length === 2, 'remembered restart');
+  assert.equal(harness.dialogCalls.length, 1, 'restart must reuse the saved choice');
+  assert.equal(harness.quickPickCalls.length, 0);
+  assert.equal(harness.spawnCalls[1].options.cwd, 'D:/Workspace/FR');
+});
+
+test('a missing remembered directory is re-picked instead of silently using the project root', async () => {
+  const workspaceFile = MockUri.file('C:/workspaces/demo.code-workspace');
+  const owner = MockUri.file('C:/demo');
+  const namespace = `${workspaceFile.toString()}|${owner.toString()}`;
+  const harness = makeHarness({
+    workspaceFile,
+    directories: ['D:/Workspace/valid'],
+    openDialogChoice: [MockUri.file('D:/Workspace/valid')],
+    workspaceStateSeed: {
+      'opencodeTerminal.chosenWorkingDirectories.v1': {
+        [namespace]: 'D:/Workspace/missing',
+      },
+    },
+  });
+  await startReady(harness);
+
+  assert.equal(harness.dialogCalls.length, 1);
+  assert.equal(harness.spawnCalls.length, 1);
+  assert.equal(harness.spawnCalls[0].options.cwd, 'D:/Workspace/valid');
+  const saved = harness.workspaceState.get(
+    'opencodeTerminal.chosenWorkingDirectories.v1',
+  ) as Record<string, unknown>;
+  assert.equal(saved[namespace], 'D:/Workspace/valid');
+});
+
+test('a .code-workspace without folders never spawns and asks for a workspace folder', async () => {
+  const harness = makeHarness({
+    workspaceFile: MockUri.file('C:/workspaces/empty.code-workspace'),
+    folderPaths: [],
+  });
+  harness.resolveView();
+  harness.sendMessage({ type: 'ready', cols: 100, rows: 30 });
+  await harness.waitFor(
+    () => lastState(harness)?.workspaceMode === true,
+    'empty workspace state',
+  );
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  assert.equal(harness.dialogCalls.length, 0);
+  assert.equal(harness.quickPickCalls.length, 0);
+  assert.equal(harness.spawnCalls.length, 0);
+  assert.equal(harness.bridges.length, 0);
+  assert.match(
+    String(lastState(harness).status),
+    /添加至少一个工作区文件夹/,
+  );
+});
+
+test('switching the working directory confirms before killing an active PTY and uses exactly one picker', async () => {
+  const choices = [
+    MockUri.file('D:/Workspace/FR'),
+    MockUri.file('D:/Workspace/NEW'),
+    MockUri.file('D:/Workspace/NEW'),
+  ];
+  let choiceIndex = 0;
+  const harness = makeHarness({
+    workspaceFile: MockUri.file('C:/workspaces/demo.code-workspace'),
+    directories: ['D:/Workspace/FR', 'D:/Workspace/NEW'],
+    openDialogChoice: () => [choices[choiceIndex++]],
+  });
+  await startReady(harness);
+  assert.equal(harness.dialogCalls.length, 1);
+
+  harness.setWarningChoice(undefined);
+  harness.sendMessage({ type: 'chooseWorkspace' });
+  await harness.waitFor(() => harness.warningCalls.length === 1, 'switch confirmation');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(harness.dialogCalls.length, 2, 'only the directory picker runs');
+  assert.equal(harness.processes[0].killCount, 0, 'cancel must not kill the PTY');
+  assert.equal(harness.spawnCalls.length, 1);
+  const savedAfterCancel = harness.workspaceState.get(
+    'opencodeTerminal.chosenWorkingDirectories.v1',
+  ) as Record<string, unknown>;
+  assert.equal(
+    savedAfterCancel[
+      `${MockUri.file('C:/workspaces/demo.code-workspace').toString()}|${harness.folder.uri.toString()}`
+    ],
+    'D:/Workspace/FR',
+  );
+
+  harness.setWarningChoice('结束会话并重启');
+  harness.sendMessage({ type: 'chooseWorkspace' });
+  await harness.waitFor(() => harness.spawnCalls.length === 2, 'switched cwd spawn');
+  assert.equal(harness.dialogCalls.length, 3, 'switching must not show a second picker');
+  assert.equal(harness.processes[0].killCount, 1, 'confirmed switch ends the old session');
+  assert.equal(harness.spawnCalls[1].options.cwd, 'D:/Workspace/NEW');
+  const state = lastState(harness);
+  assert.equal(state.workingDirectory, 'D:/Workspace/NEW');
+  assert.equal(state.workspaceKey, harness.folder.uri.toString());
+  assert.equal(harness.quickPickCalls.length, 0);
 });
 
 test('legacy readClipboard messages are rejected without reading or reposting the clipboard', async () => {
@@ -1368,24 +1666,30 @@ async function startReady(harness: Harness): Promise<void> {
 function lastState(harness: Harness): {
   workspaceKey?: string | null;
   workspaceName?: string | null;
+  workspaceMode?: boolean;
+  workingDirectory?: string | null;
+  workingDirectorySource?: string | null;
   ptyActive?: boolean;
   status?: string;
   restartRecommended?: boolean;
   referenceBase?: string | null;
   spawnWorkingDirectory?: string | null;
   referenceBaseOverride?: boolean;
-  notice?: { kind?: string; message?: string };
+  notice?: { kind?: string; message?: string; epoch?: string; id?: number };
 } {
   return harness.postedOfType('state').at(-1) as {
     workspaceKey?: string | null;
     workspaceName?: string | null;
+    workspaceMode?: boolean;
+    workingDirectory?: string | null;
+    workingDirectorySource?: string | null;
     ptyActive?: boolean;
     status?: string;
     restartRecommended?: boolean;
     referenceBase?: string | null;
     spawnWorkingDirectory?: string | null;
     referenceBaseOverride?: boolean;
-    notice?: { kind?: string; message?: string };
+    notice?: { kind?: string; message?: string; epoch?: string; id?: number };
   };
 }
 
@@ -2041,9 +2345,75 @@ test('an invalid configured workingDirectory prevents both bridge and PTY spawn'
     String(lastState(harness).notice?.message),
     /工作目录不存在或不是文件夹/,
   );
+  assert.equal(
+    Number.isSafeInteger(lastState(harness).notice?.id),
+    true,
+    'host notices need a monotonic id for webview deduplication',
+  );
+  assert.equal(
+    typeof lastState(harness).notice?.epoch,
+    'string',
+    'host notices need a provider-activation epoch',
+  );
+  assert.ok(
+    (lastState(harness).notice?.epoch ?? '').length > 0,
+    'the notice epoch must not be empty',
+  );
+  const firstEpoch = lastState(harness).notice?.epoch;
+  const firstId = lastState(harness).notice?.id;
+  const stateCount = harness.postedOfType('state').length;
+  harness.sendMessage({ type: 'attach', cols: 100, rows: 30 });
+  await harness.waitFor(
+    () => harness.postedOfType('state').length > stateCount,
+    'replayed state',
+  );
+  assert.equal(
+    lastState(harness).notice?.id,
+    firstId,
+    'postState replay must keep the same notice id instead of renewing it',
+  );
+  assert.equal(
+    lastState(harness).notice?.epoch,
+    firstEpoch,
+    'postState replay must keep the same notice epoch',
+  );
   assert.equal(harness.spawnCalls.length, 0);
   assert.equal(harness.bridges.length, 0);
   assert.equal(harness.processes.length, 0);
+});
+
+test('a new provider activation gets a new notice epoch so id 1 is not swallowed', async () => {
+  const options = {
+    workingDirectory: 'D:/Workspace/missing',
+    directories: ['C:/demo'],
+  };
+  const first = makeHarness(options);
+  first.resolveView();
+  first.sendMessage({ type: 'ready', cols: 100, rows: 30 });
+  await first.waitFor(
+    () => lastState(first).notice?.kind === 'error',
+    'first provider error',
+  );
+
+  const second = makeHarness(options);
+  second.resolveView();
+  second.sendMessage({ type: 'ready', cols: 100, rows: 30 });
+  await second.waitFor(
+    () => lastState(second).notice?.kind === 'error',
+    'second provider error',
+  );
+
+  const firstNotice = lastState(first).notice;
+  const secondNotice = lastState(second).notice;
+  assert.equal(firstNotice?.id, 1);
+  assert.equal(secondNotice?.id, 1);
+  assert.ok(firstNotice?.epoch, 'the first provider must send an epoch');
+  assert.ok(secondNotice?.epoch, 'the second provider must send an epoch');
+  assert.notEqual(
+    firstNotice?.epoch,
+    secondNotice?.epoch,
+    'a restarted extension host must not reuse the old epoch',
+  );
 });
 
 test('setReferenceBase requires an active PTY and opens no dialog without one', async () => {
