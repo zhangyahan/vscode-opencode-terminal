@@ -580,8 +580,8 @@ document.addEventListener(
       }
       showNotice(
         fileCount > 0
-          ? '系统文件管理器拖入的文件没有暴露本地路径（VS Code webview 限制）。请拖到 TUI 下方的“拖入文件”原生区域，或使用命令面板的“OpenCode: 选择文件插入 @ 引用”。'
-          : '未识别到文件或选区。请把文件拖到 TUI 下方的“拖入文件”原生区域；webview 内的 Explorer 拖放受 VS Code 平台限制，不保证可用。不要拖入任意纯文本。',
+          ? '系统文件管理器拖入的文件没有暴露本地路径（VS Code webview 限制）。请拖到底部面板中 TUI 左侧的“拖入文件”原生区域，或使用命令面板的“OpenCode: 选择文件插入 @ 引用”。'
+          : '未识别到文件或选区。请把文件拖到底部面板中 TUI 左侧的“拖入文件”原生区域；webview 内的 Explorer 拖放受 VS Code 平台限制，不保证可用。不要拖入任意纯文本。',
         'error',
       );
       return;

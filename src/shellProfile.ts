@@ -15,7 +15,8 @@
  *  3. `vscode.env.shell` when no explicit profile is selected.
  *  4. `ComSpec` on Windows or `/bin/sh` on POSIX, with a warning.
  *
- * The working directory is always the workspace folder. Environment values are
+ * The working directory is the supplied effective PTY cwd (which defaults to
+ * the workspace folder). Environment values are
  * merged base -> integrated -> profile, support `null` deletion, Windows
  * case-insensitive keys and `${env:...}`, `${userHome}`, `${workspaceFolder}`
  * and related variables. Warning messages never contain environment values.

@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { resolve as resolvePath } from 'node:path';
+import { homedir } from 'node:os';
+import { resolve as resolvePath, win32 as win32Path } from 'node:path';
 
 import type {
   EditorBridgeLike,
@@ -200,6 +201,32 @@ interface SpawnCall {
   };
 }
 
+interface MockFolder {
+  readonly name: string;
+  readonly uri: MockUri;
+  readonly fsPath: string;
+}
+
+/**
+ * VS Code compares workspace folders by URI path, which on Windows is
+ * case-insensitive and segment-boundary aware. Resolve through win32 so
+ * `C:/demo` never matches `C:/demo-two` and nested roots can win by length.
+ */
+function canonicalWorkspacePath(fsPath: string): string {
+  const resolved = win32Path.resolve(fsPath);
+  const trimmed =
+    resolved.length > 3 ? resolved.replace(/[\\/]+$/, '') : resolved;
+  return trimmed.toLowerCase();
+}
+
+function isSameOrInsidePath(target: string, root: string): boolean {
+  if (target === root) {
+    return true;
+  }
+  const prefix = root.endsWith('\\') ? root : `${root}\\`;
+  return target.startsWith(prefix);
+}
+
 interface HarnessOptions {
   readonly trusted?: boolean;
   readonly command?: unknown;
@@ -213,6 +240,18 @@ interface HarnessOptions {
   readonly createEditorBridge?: () => FakeEditorBridge;
   readonly documentLineCount?: number;
   readonly fileSize?: number;
+  readonly workingDirectory?: unknown;
+  readonly userProfileArgs?: readonly string[];
+  readonly directories?: readonly string[];
+  readonly invalidDirectories?: readonly string[];
+  readonly openDialogChoice?:
+    | readonly MockUri[]
+    | ((
+        options: Record<string, unknown>,
+      ) =>
+        | readonly MockUri[]
+        | undefined
+        | Promise<readonly MockUri[] | undefined>);
 }
 
 interface MockTreeViewRegistration {
@@ -221,7 +260,7 @@ interface MockTreeViewRegistration {
 }
 
 interface Harness {
-  readonly folder: { readonly name: string; readonly uri: MockUri; readonly fsPath: string };
+  readonly folder: MockFolder;
   readonly context: MockContext;
   readonly extension: {
     activate(context: MockContext, dependencies?: unknown): void;
@@ -239,10 +278,16 @@ interface Harness {
   readonly outputLines: string[];
   readonly openDocuments: MockUri[];
   readonly clipboard: { value: string; reads: number };
+  readonly dialogCalls: Array<Record<string, unknown>>;
   setActiveEditor(editor: unknown): void;
   resolveView(): { readonly html: string };
   sendMessage(message: unknown): void;
+  addRoot(fsPath: string, name?: string): MockFolder;
+  workspaceFolders(): readonly MockFolder[];
+  getWorkspaceFolder(uri: MockUri): MockFolder | undefined;
   removeFolder(): void;
+  setWorkingDirectory(value: unknown): void;
+  fireConfigurationChange(...sections: string[]): void;
   waitFor(predicate: () => boolean, message: string): Promise<void>;
   postedOfType(type: string): Array<Record<string, unknown>>;
 }
@@ -258,11 +303,11 @@ interface MockContext {
 
 function makeHarness(options: HarnessOptions = {}): Harness {
   const trusted = options.trusted ?? true;
-  const folder = {
-    name: 'demo',
-    uri: MockUri.file('C:/demo'),
-    fsPath: 'C:/demo',
+  const createFolder = (fsPath: string, name: string): MockFolder => {
+    const uri = MockUri.file(fsPath);
+    return { name, uri, fsPath: uri.fsPath };
   };
+  const folder = createFolder('C:/demo', 'demo');
   const extensionUri = MockUri.file('C:/extension');
   const workspaceState = new Map<string, unknown>();
   const commands = new Map<string, (...args: unknown[]) => unknown>();
@@ -277,8 +322,13 @@ function makeHarness(options: HarnessOptions = {}): Harness {
   const outputLines: string[] = [];
   const openDocuments: MockUri[] = [];
   const clipboard = { value: '', reads: 0 };
+  const dialogCalls: Array<Record<string, unknown>> = [];
   const folderChangeListeners = new Set<(event: unknown) => void>();
-  let folders = [folder];
+  const configurationChangeListeners = new Set<
+    (event: { affectsConfiguration(section: string): boolean }) => void
+  >();
+  let workingDirectoryValue: unknown = options.workingDirectory ?? '';
+  let folders: MockFolder[] = [folder];
   let nextSession = 0;
   let messageHandler: ((message: unknown) => void) | undefined;
   let registeredProvider:
@@ -297,7 +347,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     ...(options.userProfilePath === undefined
       ? { source: 'PowerShell' }
       : { path: options.userProfilePath }),
-    args: ['-NoLogo'],
+    args: [...(options.userProfileArgs ?? ['-NoLogo'])],
     env: { PROFILE_ENV: 'yes' },
   };
   const inspectEntries = new Map<string, Record<string, unknown>>([
@@ -345,9 +395,13 @@ function makeHarness(options: HarnessOptions = {}): Harness {
 
   const commandConfiguration = {
     get(key: string, fallback?: unknown): unknown {
-      return key === 'command'
-        ? options.command ?? 'opencode'
-        : fallback;
+      if (key === 'command') {
+        return options.command ?? 'opencode';
+      }
+      if (key === 'workingDirectory') {
+        return workingDirectoryValue;
+      }
+      return fallback;
     },
     inspect(): unknown {
       return undefined;
@@ -355,6 +409,20 @@ function makeHarness(options: HarnessOptions = {}): Harness {
   };
 
   const disposable = { dispose() {} };
+  function findWorkspaceFolder(uri: MockUri): MockFolder | undefined {
+    const target = canonicalWorkspacePath(uri.fsPath);
+    let best: { readonly folder: MockFolder; readonly length: number } | undefined;
+    for (const candidate of folders) {
+      const root = canonicalWorkspacePath(candidate.fsPath);
+      if (!isSameOrInsidePath(target, root)) {
+        continue;
+      }
+      if (best === undefined || root.length > best.length) {
+        best = { folder: candidate, length: root.length };
+      }
+    }
+    return best?.folder;
+  }
   const vscodeMock: Record<string, unknown> = {
     Uri: MockUri,
     EventEmitter: MockEventEmitter,
@@ -369,21 +437,14 @@ function makeHarness(options: HarnessOptions = {}): Harness {
       get isTrusted() {
         return trusted;
       },
-      getConfiguration: (section: string) =>
+      getConfiguration: (
+        section: string,
+        _scope?: unknown,
+      ) =>
         section === 'terminal.integrated'
           ? terminalConfiguration
           : commandConfiguration,
-      getWorkspaceFolder: (uri: MockUri) => {
-        for (const candidate of folders) {
-          if (
-            uri.fsPath === candidate.fsPath ||
-            uri.fsPath.startsWith(`${candidate.fsPath}/`)
-          ) {
-            return candidate;
-          }
-        }
-        return undefined;
-      },
+      getWorkspaceFolder: (uri: MockUri) => findWorkspaceFolder(uri),
       onDidChangeWorkspaceFolders: (listener: (event: unknown) => void) => {
         folderChangeListeners.add(listener);
         return {
@@ -392,7 +453,16 @@ function makeHarness(options: HarnessOptions = {}): Harness {
       },
       onDidGrantWorkspaceTrust: () => disposable,
       onDidChangeTextDocument: () => disposable,
-      onDidChangeConfiguration: () => disposable,
+      onDidChangeConfiguration: (
+        listener: (event: {
+          affectsConfiguration(section: string): boolean;
+        }) => void,
+      ) => {
+        configurationChangeListeners.add(listener);
+        return {
+          dispose: () => configurationChangeListeners.delete(listener),
+        };
+      },
       openTextDocument: async (uri: MockUri) => {
         openDocuments.push(uri);
         return {
@@ -439,7 +509,13 @@ function makeHarness(options: HarnessOptions = {}): Harness {
         clear: () => undefined,
         dispose: () => undefined,
       }),
-      showOpenDialog: async () => undefined,
+      showOpenDialog: async (dialogOptions: Record<string, unknown>) => {
+        dialogCalls.push(dialogOptions);
+        const choice = options.openDialogChoice;
+        return typeof choice === 'function'
+          ? await choice(dialogOptions)
+          : choice;
+      },
       showQuickPick: async () => undefined,
       showWarningMessage: async (...args: unknown[]) => {
         warningCalls.push(args);
@@ -521,6 +597,26 @@ function makeHarness(options: HarnessOptions = {}): Harness {
         bridges.push(bridge);
         return bridge;
       },
+      statDirectory: async (fsPath: string) => {
+        const target = canonicalWorkspacePath(fsPath);
+        if (
+          (options.invalidDirectories ?? []).some(
+            (candidate) => canonicalWorkspacePath(candidate) === target,
+          )
+        ) {
+          return false;
+        }
+        if (
+          (options.directories ?? []).some(
+            (candidate) => canonicalWorkspacePath(candidate) === target,
+          )
+        ) {
+          return true;
+        }
+        return folders.some(
+          (candidate) => canonicalWorkspacePath(candidate.fsPath) === target,
+        );
+      },
     });
 
     function resolveView(): { readonly html: string } {
@@ -579,6 +675,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
       outputLines,
       openDocuments,
       clipboard,
+      dialogCalls,
       setActiveEditor(editor: unknown) {
         activeEditor = editor;
       },
@@ -589,10 +686,46 @@ function makeHarness(options: HarnessOptions = {}): Harness {
         }
         messageHandler(message);
       },
+      addRoot(fsPath: string, name?: string) {
+        const fallbackName =
+          fsPath
+            .replace(/\\/g, '/')
+            .replace(/\/+$/, '')
+            .split('/')
+            .filter((part) => part.length > 0)
+            .at(-1) ?? fsPath;
+        const added = createFolder(fsPath, name ?? fallbackName);
+        folders = [...folders, added];
+        for (const listener of [...folderChangeListeners]) {
+          listener({ added: [added], removed: [] });
+        }
+        return added;
+      },
+      workspaceFolders() {
+        return [...folders];
+      },
+      getWorkspaceFolder(uri: MockUri) {
+        return findWorkspaceFolder(uri);
+      },
       removeFolder() {
         folders = folders.filter((candidate) => candidate !== folder);
         for (const listener of [...folderChangeListeners]) {
           listener({ added: [], removed: [folder] });
+        }
+      },
+      setWorkingDirectory(value: unknown) {
+        workingDirectoryValue = value;
+      },
+      fireConfigurationChange(...sections: string[]) {
+        for (const listener of [...configurationChangeListeners]) {
+          listener({
+            affectsConfiguration(section: string) {
+              return sections.some(
+                (candidate) =>
+                  section === candidate || section.startsWith(`${candidate}.`),
+              );
+            },
+          });
         }
       },
       waitFor,
@@ -1222,6 +1355,40 @@ function dropController(harness: Harness): DropController {
   return controller;
 }
 
+async function startReady(harness: Harness): Promise<void> {
+  harness.resolveView();
+  harness.sendMessage({ type: 'ready', cols: 100, rows: 30 });
+  await harness.waitFor(() => harness.spawnCalls.length === 1, 'PTY spawn');
+  await harness.waitFor(
+    () => harness.postedOfType('ptySnapshot').length > 0,
+    'snapshot',
+  );
+}
+
+function lastState(harness: Harness): {
+  workspaceKey?: string | null;
+  workspaceName?: string | null;
+  ptyActive?: boolean;
+  status?: string;
+  restartRecommended?: boolean;
+  referenceBase?: string | null;
+  spawnWorkingDirectory?: string | null;
+  referenceBaseOverride?: boolean;
+  notice?: { kind?: string; message?: string };
+} {
+  return harness.postedOfType('state').at(-1) as {
+    workspaceKey?: string | null;
+    workspaceName?: string | null;
+    ptyActive?: boolean;
+    status?: string;
+    restartRecommended?: boolean;
+    referenceBase?: string | null;
+    spawnWorkingDirectory?: string | null;
+    referenceBaseOverride?: boolean;
+    notice?: { kind?: string; message?: string };
+  };
+}
+
 test('native tree drop writes multiple real URI files without Enter and skips directories', async () => {
   const harness = makeHarness({
     statType: (uri) => (uri.fsPath.endsWith('/dir.ts') ? 2 : 1),
@@ -1321,6 +1488,250 @@ test('native tree drop of whole files and multi-select uses only plain @paths wi
   };
   assert.match(String(state.notice?.message), /需手动确认/);
   assert.match(String(state.notice?.message), /整文件以纯文本/);
+});
+
+test('native tree drop accepts other registered roots and keeps nested roots relative', async () => {
+  const harness = makeHarness();
+  await startReady(harness);
+
+  const other = harness.addRoot('D:/other', 'other');
+  const mobile = harness.addRoot('C:/demo/apps/mobile', 'mobile');
+  const caseRoot = harness.addRoot('C:/OtherRoot', 'CaseRoot');
+
+  assert.deepEqual(
+    harness.workspaceFolders().map((folder) => folder.fsPath),
+    ['C:/demo', 'D:/other', 'C:/demo/apps/mobile', 'C:/OtherRoot'],
+    'the added roots must be real workspace folders, not undefined externals',
+  );
+  assert.equal(
+    harness.getWorkspaceFolder(MockUri.file('D:/other/src/b.ts'))?.uri.toString(),
+    other.uri.toString(),
+  );
+  assert.equal(
+    harness
+      .getWorkspaceFolder(MockUri.file('C:/demo/apps/mobile/src/x.ts'))
+      ?.uri.toString(),
+    mobile.uri.toString(),
+    'the longest nested root must win',
+  );
+  assert.equal(
+    harness.getWorkspaceFolder(MockUri.file('c:/otherroot/src/c.ts'))?.uri.toString(),
+    caseRoot.uri.toString(),
+    'Windows workspace matching must be case-insensitive',
+  );
+  assert.equal(
+    harness.getWorkspaceFolder(MockUri.file('C:/demo-two/src/z.ts')),
+    undefined,
+    'a sibling prefix that is not a path segment must not match C:/demo',
+  );
+
+  const controller = dropController(harness);
+  await controller.handleDrop(
+    undefined,
+    nativeTransfer({
+      'text/uri-list': {
+        text: [
+          'file:///D:/other/src/b.ts',
+          'file:///C:/demo/apps/mobile/src/x.ts',
+          'file:///c:/otherroot/src/c.ts',
+        ].join('\r\n'),
+      },
+    }),
+    { isCancellationRequested: false },
+  );
+  await harness.waitFor(
+    () => harness.processes[0].writes.length === 2,
+    'cross-root native mention write',
+  );
+
+  assert.equal(
+    harness.processes[0].writes[1],
+    '@D:/other/src/b.ts @apps/mobile/src/x.ts @c:/otherroot/src/c.ts',
+  );
+  assert.equal(/[\r\n\t]/.test(harness.processes[0].writes[1]), false);
+  assert.equal(
+    harness.processes[0].writes[1].includes('#'),
+    false,
+    'whole files must not gain a range suffix',
+  );
+  assert.equal(harness.spawnCalls.length, 1, 'adding roots must not spawn another PTY');
+  assert.equal(harness.spawnCalls[0].options.cwd, harness.folder.fsPath);
+  assert.equal(
+    lastState(harness).workspaceKey,
+    harness.folder.uri.toString(),
+    'the active session folder must not change',
+  );
+});
+
+test('webview drop accepts cross-root and outside files as absolute mentions', async () => {
+  const harness = makeHarness();
+  await startReady(harness);
+  harness.addRoot('D:/other', 'other');
+  harness.addRoot('C:/demo/apps/mobile', 'mobile');
+
+  harness.sendMessage({
+    type: 'drop',
+    uriList: [
+      'file:///D:/other/src/b.ts',
+      'file:///C:/demo/apps/mobile/src/x.ts',
+      'file:///C:/external/outside.ts',
+    ].join('\r\n'),
+  });
+  await harness.waitFor(
+    () => harness.processes[0].writes.length === 2,
+    'cross-root webview drop write',
+  );
+
+  assert.equal(
+    harness.processes[0].writes[1],
+    '@D:/other/src/b.ts @apps/mobile/src/x.ts @C:/external/outside.ts',
+  );
+  assert.equal(harness.processes[0].writes[1].includes('\r'), false);
+  assert.equal(harness.spawnCalls.length, 1);
+  assert.equal(harness.spawnCalls[0].options.cwd, harness.folder.fsPath);
+});
+
+test('Explorer addFile accepts cross-root and nested files without switching sessions', async () => {
+  const harness = makeHarness();
+  await startReady(harness);
+  harness.addRoot('D:/other', 'other');
+  harness.addRoot('C:/demo/apps/mobile', 'mobile');
+
+  const addFile = harness.commands.get('opencodeTerminal.addFile') as
+    | ((uri: MockUri) => Promise<void>)
+    | undefined;
+  assert.ok(addFile);
+
+  await addFile(MockUri.file('D:/other/src/b.ts'));
+  await harness.waitFor(
+    () => harness.processes[0].writes.length === 2,
+    'cross-root addFile write',
+  );
+  assert.equal(harness.processes[0].writes[1], '@D:/other/src/b.ts');
+
+  await addFile(MockUri.file('C:/demo/apps/mobile/src/x.ts'));
+  await harness.waitFor(
+    () => harness.processes[0].writes.length === 3,
+    'nested addFile write',
+  );
+  assert.equal(harness.processes[0].writes[2], '@apps/mobile/src/x.ts');
+  assert.equal(
+    /[\r\n\t]/.test(harness.processes[0].writes.slice(1).join('')),
+    false,
+  );
+  assert.equal(harness.spawnCalls.length, 1);
+  assert.equal(harness.spawnCalls[0].options.cwd, harness.folder.fsPath);
+  assert.equal(lastState(harness).workspaceKey, harness.folder.uri.toString());
+});
+
+test('cross-root selections use the active session root and bridge absolute paths', async () => {
+  const harness = makeHarness({ documentLineCount: 42 });
+  await startReady(harness);
+  harness.addRoot('D:/other', 'other');
+
+  const bridge = harness.bridges[0];
+  bridge.ready = true;
+  const document = {
+    uri: MockUri.file('D:/other/src/b.ts'),
+    getText: () => 'const b = 2;',
+    lineCount: 42,
+  };
+  const selection = {
+    isEmpty: false,
+    start: { line: 10, character: 0 },
+    end: { line: 12, character: 0 },
+  };
+  harness.setActiveEditor({ document, selection, selections: [selection] });
+
+  const addSelection = harness.commands.get('opencodeTerminal.addSelection') as
+    | (() => Promise<void>)
+    | undefined;
+  assert.ok(addSelection);
+  await addSelection();
+  await harness.waitFor(() => bridge.sent.length === 1, 'cross-root bridge send');
+  assert.deepEqual(bridge.sent[0], {
+    filePath: 'D:/other/src/b.ts',
+    lineStart: 11,
+    lineEnd: 12,
+  });
+
+  const single = {
+    isEmpty: false,
+    start: { line: 4, character: 2 },
+    end: { line: 4, character: 10 },
+  };
+  harness.setActiveEditor({ document, selection: single, selections: [single] });
+  await addSelection();
+  await harness.waitFor(
+    () => harness.processes[0].writes.length === 2,
+    'cross-root single-line fallback',
+  );
+  assert.equal(harness.processes[0].writes[1], '@D:/other/src/b.ts#5-5');
+  assert.equal(/[\r\n\t]/.test(harness.processes[0].writes[1]), false);
+  assert.equal(bridge.sent.length, 1, 'single-line selections stay text-only');
+  assert.equal(harness.spawnCalls.length, 1);
+  assert.equal(harness.spawnCalls[0].options.cwd, harness.folder.fsPath);
+  assert.equal(
+    lastState(harness).workspaceKey,
+    harness.folder.uri.toString(),
+    'referencing another root must not switch the active session',
+  );
+});
+
+test('multi-root support still rejects directories and untrusted writes', async () => {
+  const trusted = makeHarness({
+    statType: (uri) => (uri.fsPath.endsWith('/dir.ts') ? 2 : 1),
+  });
+  await startReady(trusted);
+  trusted.addRoot('D:/other', 'other');
+
+  await dropController(trusted).handleDrop(
+    undefined,
+    nativeTransfer({
+      'text/uri-list': { text: 'file:///D:/other/src/dir.ts' },
+    }),
+    { isCancellationRequested: false },
+  );
+  assert.equal(trusted.processes[0].writes.length, 1, 'directories must not be written');
+  assert.match(
+    String(lastState(trusted).notice?.message),
+    /不支持文件夹|未写入引用/,
+  );
+
+  trusted.processes[0].emitExit(0);
+  await trusted.waitFor(
+    () => lastState(trusted).ptyActive === false,
+    'PTY exit state',
+  );
+  await dropController(trusted).handleDrop(
+    undefined,
+    nativeTransfer({
+      'text/uri-list': { text: 'file:///D:/other/src/b.ts' },
+    }),
+    { isCancellationRequested: false },
+  );
+  assert.equal(
+    trusted.processes[0].writes.length,
+    1,
+    'an exited/inactive PTY must not receive cross-root references',
+  );
+  assert.match(String(lastState(trusted).notice?.message), /PTY 未运行/);
+
+  const untrusted = makeHarness({ trusted: false });
+  untrusted.addRoot('D:/other', 'other');
+  await dropController(untrusted).handleDrop(
+    undefined,
+    nativeTransfer({
+      'text/uri-list': { text: 'file:///D:/other/src/b.ts' },
+    }),
+    { isCancellationRequested: false },
+  );
+  assert.equal(untrusted.spawnCalls.length, 0);
+  assert.equal(untrusted.processes.length, 0);
+  assert.equal(
+    untrusted.errorMessages.some((message) => /限制模式/.test(message)),
+    true,
+  );
 });
 
 test('native tree CodeFiles native absolute paths and asFile URIs are accepted', async () => {
@@ -1439,6 +1850,414 @@ test('native tree drop reports an async asString failure without writing', async
     notice?: { message?: string };
   };
   assert.match(String(state.notice?.message), /异步读取失败|未写入引用/);
+});
+
+test('workingDirectory config spawns FR while the workspace owner and key stay on the project', async () => {
+  const harness = makeHarness({
+    workingDirectory: 'D:/Workspace/FR',
+    directories: ['D:/Workspace/FR'],
+  });
+  await startReady(harness);
+
+  assert.equal(harness.spawnCalls.length, 1);
+  assert.equal(harness.spawnCalls[0].options.cwd, 'D:/Workspace/FR');
+  assert.equal(harness.spawnCalls[0].options.cwd, harness.spawnCalls[0].options.cwd.trim());
+  assert.equal(
+    lastState(harness).workspaceKey,
+    harness.folder.uri.toString(),
+    'a configured cwd must not change the workspace/session owner',
+  );
+  assert.equal(lastState(harness).workspaceName, harness.folder.name);
+  assert.equal(lastState(harness).spawnWorkingDirectory, 'D:/Workspace/FR');
+
+  await dropController(harness).handleDrop(
+    undefined,
+    nativeTransfer({
+      'text/uri-list': {
+        text:
+          'file:///D:/Workspace/FR/sai-qx-student-client/apps/mobile/src/a.ts',
+      },
+    }),
+    { isCancellationRequested: false },
+  );
+  await harness.waitFor(
+    () => harness.processes[0].writes.length === 2,
+    'FR reference write',
+  );
+
+  assert.equal(
+    harness.processes[0].writes[1],
+    '@sai-qx-student-client/apps/mobile/src/a.ts',
+    'the spawn cwd must be the reference base without any cd detection',
+  );
+  assert.equal(harness.spawnCalls.length, 1, 'referencing must not spawn again');
+  assert.equal(
+    lastState(harness).workspaceKey,
+    harness.folder.uri.toString(),
+  );
+});
+
+test('workingDirectory keeps shell profile workspace variables synchronized with the effective cwd', async () => {
+  const harness = makeHarness({
+    workingDirectory: 'D:/Workspace/FR',
+    directories: ['D:/Workspace/FR'],
+    userProfileArgs: [
+      '${workspaceFolder}',
+      '${workspaceFolderBasename}',
+      '${userHome}',
+    ],
+  });
+  await startReady(harness);
+
+  assert.deepEqual(harness.spawnCalls[0].args.slice(0, 3), [
+    'D:/Workspace/FR',
+    'FR',
+    homedir(),
+  ]);
+  assert.equal(
+    harness.spawnCalls[0].args[0],
+    harness.spawnCalls[0].options.cwd,
+    'profile expansion and the spawn cwd must agree',
+  );
+});
+
+test('changing workingDirectory at runtime only recommends a restart and keeps the current reference base', async () => {
+  const harness = makeHarness();
+  await startReady(harness);
+
+  harness.setWorkingDirectory('D:/Workspace/FR');
+  harness.fireConfigurationChange('opencodeTerminal.workingDirectory');
+  await harness.waitFor(
+    () => lastState(harness).restartRecommended === true,
+    'restart recommendation',
+  );
+
+  assert.equal(harness.spawnCalls.length, 1);
+  assert.equal(harness.spawnCalls[0].options.cwd, harness.folder.fsPath);
+  assert.equal(lastState(harness).referenceBase, harness.folder.fsPath);
+  assert.match(String(lastState(harness).status), /重启 PTY 后生效/);
+
+  await dropController(harness).handleDrop(
+    undefined,
+    nativeTransfer({
+      'text/uri-list': { text: 'file:///C:/demo/src/a.ts' },
+    }),
+    { isCancellationRequested: false },
+  );
+  await harness.waitFor(
+    () => harness.processes[0].writes.length === 2,
+    'current-base reference write',
+  );
+  assert.equal(
+    harness.processes[0].writes[1],
+    '@src/a.ts',
+    'a pending setting change must not change the running session base',
+  );
+});
+
+test('setReferenceBase changes only later @ mentions without writing, spawning or killing', async () => {
+  const harness = makeHarness({
+    directories: ['D:/Workspace/FR'],
+    openDialogChoice: [MockUri.file('D:/Workspace/FR')],
+  });
+  await startReady(harness);
+  const writesBefore = harness.processes[0].writes.length;
+  const killBefore = harness.processes[0].killCount;
+  const bridgeStopsBefore = harness.bridges[0].stopCount;
+
+  const setReferenceBase = harness.commands.get(
+    'opencodeTerminal.setReferenceBase',
+  ) as (() => Promise<void>) | undefined;
+  assert.ok(setReferenceBase);
+  await setReferenceBase();
+
+  assert.equal(harness.dialogCalls.length, 1);
+  assert.equal(
+    harness.dialogCalls[0].canSelectFolders,
+    true,
+    'the native folder dialog must be used',
+  );
+  assert.equal(harness.dialogCalls[0].canSelectFiles, false);
+  assert.equal(
+    (harness.dialogCalls[0].defaultUri as MockUri).fsPath,
+    harness.folder.fsPath,
+    'the dialog must default to the current reference base',
+  );
+  assert.equal(
+    harness.processes[0].writes.length,
+    writesBefore,
+    'the command must never write to the PTY',
+  );
+  assert.equal(harness.spawnCalls.length, 1, 'the command must not spawn');
+  assert.equal(harness.processes[0].killCount, killBefore);
+  assert.equal(harness.bridges[0].stopCount, bridgeStopsBefore);
+  assert.equal(lastState(harness).referenceBaseOverride, true);
+  assert.equal(lastState(harness).referenceBase, 'D:/Workspace/FR');
+  assert.equal(lastState(harness).spawnWorkingDirectory, harness.folder.fsPath);
+  assert.match(String(lastState(harness).status), /仅本会话手动设置/);
+  assert.match(String(lastState(harness).status), /未执行 cd/);
+  assert.match(String(lastState(harness).notice?.message), /只影响之后的 @ 引用/);
+  assert.match(String(lastState(harness).notice?.message), /重启 PTY 后恢复启动目录/);
+  assert.equal(
+    lastState(harness).workspaceKey,
+    harness.folder.uri.toString(),
+    'the active owner must not switch',
+  );
+
+  await dropController(harness).handleDrop(
+    undefined,
+    nativeTransfer({
+      'text/uri-list': {
+        text:
+          'file:///D:/Workspace/FR/sai-qx-student-client/apps/mobile/src/a.ts',
+      },
+    }),
+    { isCancellationRequested: false },
+  );
+  await harness.waitFor(
+    () => harness.processes[0].writes.length === writesBefore + 1,
+    'override reference write',
+  );
+  assert.equal(
+    harness.processes[0].writes.at(-1),
+    '@sai-qx-student-client/apps/mobile/src/a.ts',
+  );
+  assert.equal(harness.spawnCalls.length, 1);
+});
+
+test('an invalid configured workingDirectory prevents both bridge and PTY spawn', async () => {
+  const harness = makeHarness({
+    workingDirectory: 'D:/Workspace/missing',
+    directories: ['C:/demo'],
+  });
+  harness.resolveView();
+  harness.sendMessage({ type: 'ready', cols: 100, rows: 30 });
+
+  await harness.waitFor(
+    () => lastState(harness).notice?.kind === 'error',
+    'invalid working directory error',
+  );
+  assert.match(
+    String(lastState(harness).notice?.message),
+    /工作目录不存在或不是文件夹/,
+  );
+  assert.equal(harness.spawnCalls.length, 0);
+  assert.equal(harness.bridges.length, 0);
+  assert.equal(harness.processes.length, 0);
+});
+
+test('setReferenceBase requires an active PTY and opens no dialog without one', async () => {
+  const harness = makeHarness({
+    directories: ['D:/Workspace/FR'],
+    openDialogChoice: [MockUri.file('D:/Workspace/FR')],
+  });
+  harness.resolveView();
+
+  const command = harness.commands.get(
+    'opencodeTerminal.setReferenceBase',
+  ) as () => Promise<void>;
+  await command();
+
+  assert.equal(harness.dialogCalls.length, 0);
+  assert.equal(harness.spawnCalls.length, 0);
+  assert.match(
+    String(lastState(harness).notice?.message),
+    /PTY 未运行/,
+  );
+});
+
+test('setReferenceBase rejects invalid directories and untrusted workspaces', async () => {
+  const invalid = makeHarness({
+    directories: ['C:/demo'],
+    openDialogChoice: [MockUri.file('D:/Workspace/missing')],
+  });
+  await startReady(invalid);
+  const command = invalid.commands.get(
+    'opencodeTerminal.setReferenceBase',
+  ) as () => Promise<void>;
+  await command();
+
+  assert.equal(lastState(invalid).referenceBaseOverride, false);
+  assert.match(
+    String(lastState(invalid).notice?.message),
+    /引用基准目录不存在或不是文件夹/,
+  );
+  await dropController(invalid).handleDrop(
+    undefined,
+    nativeTransfer({
+      'text/uri-list': {
+        text: 'file:///D:/Workspace/FR/sai-qx-student-client/apps/mobile/src/a.ts',
+      },
+    }),
+    { isCancellationRequested: false },
+  );
+  await invalid.waitFor(
+    () => invalid.processes[0].writes.length === 2,
+    'absolute fallback after invalid dialog directory',
+  );
+  assert.equal(
+    invalid.processes[0].writes[1],
+    '@D:/Workspace/FR/sai-qx-student-client/apps/mobile/src/a.ts',
+  );
+
+  const untrusted = makeHarness({
+    trusted: false,
+    directories: ['D:/Workspace/FR'],
+    openDialogChoice: [MockUri.file('D:/Workspace/FR')],
+  });
+  const untrustedCommand = untrusted.commands.get(
+    'opencodeTerminal.setReferenceBase',
+  ) as () => Promise<void>;
+  await untrustedCommand();
+  assert.equal(untrusted.dialogCalls.length, 0, 'must fail before opening a dialog');
+  assert.equal(untrusted.spawnCalls.length, 0);
+  assert.equal(
+    untrusted.errorMessages.some((message) => /限制模式/.test(message)),
+    true,
+  );
+});
+
+test('setReferenceBase refuses to save when the PTY session changed during the dialog', async () => {
+  let harness: Harness;
+  harness = makeHarness({
+    directories: ['D:/Workspace/FR'],
+    openDialogChoice: () => {
+      harness.processes[0].emitExit(0);
+      return [MockUri.file('D:/Workspace/FR')];
+    },
+  });
+  await startReady(harness);
+
+  const command = harness.commands.get(
+    'opencodeTerminal.setReferenceBase',
+  ) as () => Promise<void>;
+  await command();
+  await harness.waitFor(
+    () => lastState(harness).notice?.kind === 'error',
+    'session-change rejection',
+  );
+  assert.match(
+    String(lastState(harness).notice?.message),
+    /活动 PTY 会话已变化|PTY 未运行/,
+  );
+  assert.equal(lastState(harness).referenceBaseOverride, false);
+
+  const startCommand = harness.commands.get('opencodeTerminal.start') as
+    | (() => Promise<void>)
+    | undefined;
+  assert.ok(startCommand);
+  await startCommand();
+  await harness.waitFor(() => harness.spawnCalls.length === 2, 'new session');
+  await dropController(harness).handleDrop(
+    undefined,
+    nativeTransfer({
+      'text/uri-list': {
+        text: 'file:///D:/Workspace/FR/sai-qx-student-client/apps/mobile/src/a.ts',
+      },
+    }),
+    { isCancellationRequested: false },
+  );
+  await harness.waitFor(
+    () => harness.processes[1].writes.length === 2,
+    'absolute reference after rejected override',
+  );
+  assert.equal(
+    harness.processes[1].writes[1],
+    '@D:/Workspace/FR/sai-qx-student-client/apps/mobile/src/a.ts',
+  );
+});
+
+test('restart and exit discard the in-memory reference base override', async () => {
+  const harness = makeHarness({
+    directories: ['D:/Workspace/FR'],
+    openDialogChoice: [MockUri.file('D:/Workspace/FR')],
+  });
+  await startReady(harness);
+  const setReferenceBase = harness.commands.get(
+    'opencodeTerminal.setReferenceBase',
+  ) as () => Promise<void>;
+  await setReferenceBase();
+  assert.equal(lastState(harness).referenceBaseOverride, true);
+
+  harness.sendMessage({ type: 'restart' });
+  await harness.waitFor(() => harness.spawnCalls.length === 2, 'restarted PTY');
+  await harness.waitFor(
+    () => lastState(harness).referenceBaseOverride === false,
+    'override cleared on restart',
+  );
+  assert.equal(lastState(harness).referenceBase, harness.folder.fsPath);
+  assert.equal(lastState(harness).spawnWorkingDirectory, harness.folder.fsPath);
+
+  await dropController(harness).handleDrop(
+    undefined,
+    nativeTransfer({
+      'text/uri-list': {
+        text: 'file:///D:/Workspace/FR/sai-qx-student-client/apps/mobile/src/a.ts',
+      },
+    }),
+    { isCancellationRequested: false },
+  );
+  await harness.waitFor(
+    () => harness.processes[1].writes.length === 2,
+    'absolute reference after restart',
+  );
+  assert.equal(
+    harness.processes[1].writes[1],
+    '@D:/Workspace/FR/sai-qx-student-client/apps/mobile/src/a.ts',
+  );
+
+  await setReferenceBase();
+  assert.equal(lastState(harness).referenceBaseOverride, true);
+  harness.processes[1].emitExit(0);
+  await harness.waitFor(
+    () => lastState(harness).referenceBaseOverride === false,
+    'override cleared on exit',
+  );
+  assert.equal(lastState(harness).referenceBase, null);
+});
+
+test('removing a workspace discards its reference base override', async () => {
+  const harness = makeHarness({
+    directories: ['D:/Workspace/FR'],
+    openDialogChoice: [MockUri.file('D:/Workspace/FR')],
+  });
+  await startReady(harness);
+  const setReferenceBase = harness.commands.get(
+    'opencodeTerminal.setReferenceBase',
+  ) as () => Promise<void>;
+  await setReferenceBase();
+  assert.equal(lastState(harness).referenceBaseOverride, true);
+
+  harness.removeFolder();
+  await harness.waitFor(
+    () => lastState(harness).workspaceKey === null,
+    'workspace removal',
+  );
+  harness.addRoot('C:/demo', 'demo');
+  const startCommand = harness.commands.get('opencodeTerminal.start') as
+    | (() => Promise<void>)
+    | undefined;
+  assert.ok(startCommand);
+  await startCommand();
+  await harness.waitFor(() => harness.spawnCalls.length === 2, 're-added session');
+
+  await dropController(harness).handleDrop(
+    undefined,
+    nativeTransfer({
+      'text/uri-list': {
+        text: 'file:///D:/Workspace/FR/sai-qx-student-client/apps/mobile/src/a.ts',
+      },
+    }),
+    { isCancellationRequested: false },
+  );
+  await harness.waitFor(
+    () => harness.processes[1].writes.length === 2,
+    'absolute reference after folder re-add',
+  );
+  assert.equal(
+    harness.processes[1].writes[1],
+    '@D:/Workspace/FR/sai-qx-student-client/apps/mobile/src/a.ts',
+  );
 });
 
 test('toolbar HTML keeps restart but no longer renders the file button', () => {

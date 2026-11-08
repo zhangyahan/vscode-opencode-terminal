@@ -178,6 +178,62 @@ test('ensure spawns once, writes the launch command once and reuses the session'
   assert.deepEqual(harness.processes[0].writes, ['opencode\r']);
 });
 
+test('getWorkingDirectory returns the recorded spawn cwd only for the current session', () => {
+  const harness = createHarness();
+  const first = harness.manager.ensure(
+    'file:///work',
+    launch({ cwd: 'D:/Workspace/FR' }),
+  );
+  assert.equal(first.ok, true);
+  if (!first.ok) {
+    return;
+  }
+
+  assert.equal(
+    harness.manager.getWorkingDirectory('file:///work', first.session.sessionId),
+    'D:/Workspace/FR',
+  );
+  assert.equal(
+    harness.manager.getWorkingDirectory('file:///work', 'session-stale'),
+    undefined,
+    'a stale session id must not expose another session cwd',
+  );
+  assert.equal(
+    harness.manager.getWorkingDirectory('file:///other', first.session.sessionId),
+    undefined,
+  );
+
+  harness.processes[0].emitExit({ exitCode: 0 });
+  assert.equal(
+    harness.manager.getWorkingDirectory('file:///work', first.session.sessionId),
+    undefined,
+    'an exited session has no working directory',
+  );
+});
+
+test('a replacement session reports its own spawn cwd and never the previous one', () => {
+  const harness = createHarness();
+  harness.manager.ensure('file:///work', launch({ cwd: 'D:/Workspace/FR' }));
+  harness.manager.stop('file:///work');
+  const second = harness.manager.ensure(
+    'file:///work',
+    launch({ cwd: 'D:/Workspace/other' }),
+  );
+  assert.equal(second.ok, true);
+  if (!second.ok) {
+    return;
+  }
+
+  assert.equal(
+    harness.manager.getWorkingDirectory('file:///work', 'session-1'),
+    undefined,
+  );
+  assert.equal(
+    harness.manager.getWorkingDirectory('file:///work', second.session.sessionId),
+    'D:/Workspace/other',
+  );
+});
+
 test('a Windows argument string is passed through unchanged', () => {
   const harness = createHarness();
   const result = harness.manager.ensure('file:///work', {

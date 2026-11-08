@@ -1,8 +1,8 @@
 {
   "name": "vscode-opencode-terminal",
   "displayName": "OpenCode Terminal by ZhangYahan",
-  "description": "Run OpenCode's real TUI inside the VS Code Secondary Sidebar using xterm.js + node-pty, with a native file drop target and @mentions.",
-  "version": "0.0.9",
+  "description": "Run OpenCode's real TUI in the VS Code bottom Panel using xterm.js + node-pty, with a native file drop target on the left and @mentions.",
+  "version": "0.0.12",
   "publisher": "zhangyahan",
   "license": "MIT",
   "repository": {
@@ -34,7 +34,8 @@
     "onCommand:opencodeTerminal.addFile",
     "onCommand:opencodeTerminal.pickFiles",
     "onCommand:opencodeTerminal.copyAll",
-    "onCommand:opencodeTerminal.clear"
+    "onCommand:opencodeTerminal.clear",
+    "onCommand:opencodeTerminal.setReferenceBase"
   ],
   "capabilities": {
     "untrustedWorkspaces": {
@@ -44,36 +45,36 @@
   },
   "contributes": {
     "viewsContainers": {
-      "secondarySidebar": [
+      "panel": [
         {
-          "id": "opencodeTerminalSecondary",
+          "id": "opencodeTerminalBottom",
           "title": "OpenCode",
           "icon": "media/opencode.svg"
         }
       ]
     },
     "views": {
-      "opencodeTerminalSecondary": [
-        {
-          "type": "webview",
-          "id": "opencodeTerminal.main",
-          "name": "OpenCode",
-          "contextualTitle": "OpenCode",
-          "initialSize": 90
-        },
+      "opencodeTerminalBottom": [
         {
           "type": "tree",
           "id": "opencodeTerminal.drop",
           "name": "拖入文件",
           "contextualTitle": "OpenCode 拖入文件",
-          "initialSize": 10
+          "initialSize": 1
+        },
+        {
+          "type": "webview",
+          "id": "opencodeTerminal.main",
+          "name": "OpenCode",
+          "contextualTitle": "OpenCode",
+          "initialSize": 99
         }
       ]
     },
     "commands": [
       {
         "command": "opencodeTerminal.open",
-        "title": "OpenCode: 打开侧栏",
+        "title": "OpenCode: 打开面板",
         "icon": "$(terminal)"
       },
       {
@@ -109,9 +110,21 @@
         "command": "opencodeTerminal.clear",
         "title": "OpenCode: 清除终端滚动缓冲",
         "icon": "$(clear-all)"
+      },
+      {
+        "command": "opencodeTerminal.setReferenceBase",
+        "title": "OpenCode: 设置引用基准目录（不执行 cd）",
+        "icon": "$(folder)"
       }
     ],
     "menus": {
+      "view/title": [
+        {
+          "command": "opencodeTerminal.setReferenceBase",
+          "when": "view == opencodeTerminal.main",
+          "group": "navigation@1"
+        }
+      ],
       "editor/context": [
         {
           "command": "opencodeTerminal.addSelection",
@@ -135,6 +148,12 @@
           "default": "opencode",
           "scope": "machine",
           "markdownDescription": "在嵌入式 PTY 中执行的 **shell 命令**（machine 作用域，工作区设置不能覆盖）。默认 `opencode`。禁止换行或控制字符；扩展不会验证该命令是否存在，也不会通过 HTTP 探测 OpenCode 版本。"
+        },
+        "opencodeTerminal.workingDirectory": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "新 PTY 会话的**启动工作目录**。留空使用所选工作区文件夹。支持绝对路径，以及 `${workspaceFolder}`、`${workspaceFolderBasename}`、`${userHome}` 三个简单变量；不支持 `${env:...}`、`${command:...}`、`$(...)`、未知变量或 shell 展开。目录必须是真实存在的本地文件夹，否则不会启动 PTY。该设置只影响新会话；已运行会话请使用命令“OpenCode: 设置引用基准目录（不执行 cd）”。"
         }
       }
     }
@@ -145,10 +164,10 @@
     "compile": "npm run build:webview && tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.webview.json --noEmit",
     "build": "npm run check && npm run compile",
-    "test": "npm run compile && node --test out/test/core.test.js out/test/runtime.test.js out/test/ptySession.test.js out/test/shellProfile.test.js out/test/references.test.js out/test/editorBridge.test.js out/test/webviewInteraction.test.js out/test/extension.integration.test.js out/test/manifest.test.js",
+    "test": "npm run compile && node --test out/test/core.test.js out/test/runtime.test.js out/test/workingDirectory.test.js out/test/ptySession.test.js out/test/shellProfile.test.js out/test/references.test.js out/test/editorBridge.test.js out/test/webviewInteraction.test.js out/test/extension.integration.test.js out/test/manifest.test.js",
     "test:native": "npm run compile && node --test --test-force-exit out/test/ptyAdapter.integration.test.js",
     "smoke:native": "npm run compile && node --test --test-force-exit out/test/ptyAdapter.integration.test.js",
-    "package": "npm run compile && vsce package --target win32-x64 --out vscode-opencode-terminal-0.0.9-win32-x64.vsix"
+    "package": "npm run compile && vsce package --target win32-x64 --out vscode-opencode-terminal-0.0.12-win32-x64.vsix"
   },
   "dependencies": {
     "@lydell/node-pty": "1.2.0-beta.18",

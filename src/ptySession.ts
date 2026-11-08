@@ -159,6 +159,8 @@ export interface PtySessionManagerOptions {
 interface ActiveSession {
   readonly workspaceKey: string;
   readonly sessionId: string;
+  /** Actual cwd passed to the spawn call; not the process's dynamic cwd. */
+  readonly cwd: string;
   readonly process: PtyProcess;
   buffer: string;
   truncated: boolean;
@@ -410,6 +412,7 @@ export class PtySessionManager {
     const session: ActiveSession = {
       workspaceKey,
       sessionId: this.createSessionId(),
+      cwd: config.cwd,
       process,
       buffer: '',
       truncated: false,
@@ -469,6 +472,26 @@ export class PtySessionManager {
 
   getSessionId(workspaceKey: string): string | undefined {
     return this.sessions.get(workspaceKey)?.sessionId;
+  }
+
+  /**
+   * Returns the cwd that was passed to spawn for the current, matching
+   * session. This is a fixed spawn argument, not the process's dynamic cwd:
+   * a user running `cd` inside the shell does not change this value.
+   */
+  getWorkingDirectory(
+    workspaceKey: string,
+    sessionId: string,
+  ): string | undefined {
+    const session = this.sessions.get(workspaceKey);
+    if (
+      session === undefined ||
+      session.exited ||
+      session.sessionId !== sessionId
+    ) {
+      return undefined;
+    }
+    return session.cwd;
   }
 
   /**

@@ -1,6 +1,6 @@
 /**
- * Native TreeView drop target shown below the xterm webview in the same
- * `opencodeTerminalSecondary` Secondary Sidebar container. It uses only stable
+ * Native TreeView drop target shown to the left of the xterm webview in the
+ * same `opencodeTerminalBottom` bottom Panel container. It uses only stable
  * VS Code tree drag/drop APIs: the webview cannot reliably receive Explorer
  * drags because of the platform iframe boundary, while a native tree view can.
  */
@@ -56,7 +56,7 @@ class FileDropHint extends vscode.TreeItem {
     super('将文件拖到此处（可多选）', vscode.TreeItemCollapsibleState.None);
     this.description = '不按回车，仅插入 @ 引用';
     this.tooltip =
-      '位于 TUI 下方。从 VS Code Explorer 拖入一个或多个文件。' +
+      '位于底部面板 TUI 左侧。从 VS Code Explorer 拖入一个或多个文件。' +
       '目录、非 file: URI、未启动的 PTY 以及受限工作区都不会写入。';
     this.contextValue = 'opencodeDropHint';
     this.iconPath = new vscode.ThemeIcon('files');
@@ -347,7 +347,7 @@ class FileDropController
   }
 }
 
-/** Registers the native drop target below the TUI in the same Secondary Sidebar container. */
+/** Registers the native drop target to the left of the TUI in the bottom Panel container. */
 export class FileDropView implements vscode.Disposable {
   private readonly treeView: vscode.TreeView<FileDropHint>;
 

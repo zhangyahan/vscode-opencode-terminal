@@ -33,7 +33,29 @@ interface Manifest {
     readonly commands?: readonly {
       readonly command: string;
       readonly title: string;
+      readonly icon?: string;
     }[];
+    readonly menus?: Readonly<
+      Record<
+        string,
+        readonly {
+          readonly command: string;
+          readonly when?: string;
+        }[]
+      >
+    >;
+    readonly configuration?: {
+      readonly properties?: Readonly<
+        Record<
+          string,
+          {
+            readonly type?: string;
+            readonly default?: unknown;
+            readonly scope?: string;
+          }
+        >
+      >;
+    };
   };
   readonly activationEvents?: readonly string[];
   readonly devDependencies?: Readonly<Record<string, string>>;
@@ -63,16 +85,16 @@ const lockfile = JSON.parse(
   readFileSync(resolvePath(projectRoot, 'package-lock.json'), 'utf8'),
 ) as Lockfile;
 
-const NEW_CONTAINER_ID = 'opencodeTerminalSecondary';
+const NEW_CONTAINER_ID = 'opencodeTerminalBottom';
 const MAIN_VIEW_ID = 'opencodeTerminal.main';
 const DROP_VIEW_ID = 'opencodeTerminal.drop';
 
-test('manifest places the extension in the Secondary Sidebar, not the panel', () => {
+test('manifest places the extension in the bottom panel, not the Secondary Sidebar', () => {
   const containers = manifest.contributes.viewsContainers;
   assert.ok(containers, 'viewsContainers is required');
-  assert.deepEqual(Object.keys(containers), ['secondarySidebar']);
-  assert.equal(containers.panel, undefined);
-  assert.deepEqual(containers.secondarySidebar, [
+  assert.deepEqual(Object.keys(containers), ['panel']);
+  assert.equal(containers.secondarySidebar, undefined);
+  assert.deepEqual(containers.panel, [
     {
       id: NEW_CONTAINER_ID,
       title: 'OpenCode',
@@ -81,7 +103,7 @@ test('manifest places the extension in the Secondary Sidebar, not the panel', ()
   ]);
 });
 
-test('new container keeps both legacy view IDs in TUI-then-drop order', () => {
+test('new container keeps both legacy view IDs with drop left and TUI right', () => {
   const views = manifest.contributes.views;
   assert.ok(views, 'views is required');
   assert.deepEqual(Object.keys(views), [NEW_CONTAINER_ID]);
@@ -90,13 +112,13 @@ test('new container keeps both legacy view IDs in TUI-then-drop order', () => {
   assert.ok(contributed, 'new container must have views');
   assert.deepEqual(
     contributed.map((view) => view.id),
-    [MAIN_VIEW_ID, DROP_VIEW_ID],
+    [DROP_VIEW_ID, MAIN_VIEW_ID],
   );
-  assert.equal(contributed[0].type, 'webview');
-  assert.equal(contributed[1].type, 'tree');
+  assert.equal(contributed[0].type, 'tree');
+  assert.equal(contributed[1].type, 'webview');
   assert.deepEqual(
     contributed.map((view) => view.initialSize),
-    [90, 10],
+    [1, 99],
   );
 });
 
@@ -113,13 +135,14 @@ test('manifest retains command and activation IDs used by extension code', () =>
     'opencodeTerminal.pickFiles',
     'opencodeTerminal.copyAll',
     'opencodeTerminal.clear',
+    'opencodeTerminal.setReferenceBase',
   ]) {
     assert.ok(commandIds.includes(id), `missing command ${id}`);
   }
   const openTitle = (manifest.contributes.commands ?? []).find(
     (command) => command.command === 'opencodeTerminal.open',
   )?.title;
-  assert.equal(openTitle, 'OpenCode: 打开侧栏');
+  assert.equal(openTitle, 'OpenCode: 打开面板');
 
   const activationEvents = manifest.activationEvents ?? [];
   for (const id of [MAIN_VIEW_ID, DROP_VIEW_ID]) {
@@ -130,7 +153,7 @@ test('manifest retains command and activation IDs used by extension code', () =>
   }
 });
 
-test('manifest requires VS Code 1.106 or newer for secondarySidebar', () => {
+test('manifest requires VS Code 1.106 or newer', () => {
   assert.equal(manifest.engines.vscode, '^1.106.0');
   const match = /^\^(\d+)\.(\d+)\.(\d+)$/.exec(manifest.engines.vscode);
   assert.ok(match, 'engines.vscode must be a caret range');
@@ -138,21 +161,53 @@ test('manifest requires VS Code 1.106 or newer for secondarySidebar', () => {
   const minor = Number(match[2]);
   assert.ok(
     major > 1 || (major === 1 && minor >= 106),
-    'secondarySidebar requires VS Code >= 1.106',
+    'the manifest must keep the existing VS Code baseline',
   );
   assert.equal(manifest.devDependencies?.['@types/vscode'], '1.106.0');
 });
 
-test('version and packaging target 0.0.9 consistently', () => {
-  assert.equal(manifest.version, '0.0.9');
-  assert.match(manifest.description, /Secondary Sidebar/);
-  assert.equal(lockfile.version, '0.0.9');
-  assert.equal(lockfile.packages['']?.version, '0.0.9');
+test('version and packaging target 0.0.12 consistently', () => {
+  assert.equal(manifest.version, '0.0.12');
+  assert.match(manifest.description, /bottom Panel/i);
+  assert.doesNotMatch(manifest.description, /Secondary Sidebar/i);
+  assert.equal(lockfile.version, '0.0.12');
+  assert.equal(lockfile.packages['']?.version, '0.0.12');
   assert.equal(lockfile.packages['']?.engines?.vscode, '^1.106.0');
 
   const packageScript = manifest.scripts?.package ?? '';
-  assert.match(packageScript, /vscode-opencode-terminal-0\.0\.9-win32-x64\.vsix/);
-  assert.doesNotMatch(packageScript, /0\.0\.8/);
+  assert.match(packageScript, /vscode-opencode-terminal-0\.0\.12-win32-x64\.vsix/);
+  assert.doesNotMatch(packageScript, /0\.0\.1[01]/);
+});
+
+test('workingDirectory setting and setReferenceBase command are contributed', () => {
+  const properties = manifest.contributes.configuration?.properties;
+  const workingDirectory = properties?.['opencodeTerminal.workingDirectory'];
+  assert.ok(workingDirectory, 'workingDirectory setting is required');
+  assert.equal(workingDirectory.type, 'string');
+  assert.equal(workingDirectory.default, '');
+  assert.equal(workingDirectory.scope, 'machine-overridable');
+
+  const command = (manifest.contributes.commands ?? []).find(
+    (entry) => entry.command === 'opencodeTerminal.setReferenceBase',
+  );
+  assert.ok(command, 'setReferenceBase command is required');
+  assert.equal(command.title, 'OpenCode: 设置引用基准目录（不执行 cd）');
+  assert.equal(command.icon, '$(folder)');
+
+  const viewTitle = manifest.contributes.menus?.['view/title'] ?? [];
+  assert.ok(
+    viewTitle.some(
+      (entry) =>
+        entry.command === 'opencodeTerminal.setReferenceBase' &&
+        (entry.when ?? '').includes('opencodeTerminal.main'),
+    ),
+    'the command needs a lightweight view/title entry for the main view',
+  );
+  assert.ok(
+    (manifest.activationEvents ?? []).includes(
+      'onCommand:opencodeTerminal.setReferenceBase',
+    ),
+  );
 });
 
 test('marketplace display name is unique without changing IDs or view titles', () => {
@@ -166,9 +221,14 @@ test('marketplace display name is unique without changing IDs or view titles', (
     'zhangyahan.vscode-opencode-terminal',
   );
 
-  const container = manifest.contributes.viewsContainers?.secondarySidebar?.[0];
+  const container = manifest.contributes.viewsContainers?.panel?.[0];
   assert.equal(container?.title, 'OpenCode');
-  assert.equal(manifest.contributes.views?.[NEW_CONTAINER_ID]?.[0]?.name, 'OpenCode');
+  assert.equal(
+    manifest.contributes.views?.[NEW_CONTAINER_ID]?.find(
+      (view) => view.id === MAIN_VIEW_ID,
+    )?.name,
+    'OpenCode',
+  );
 
   const readme = readFileSync(resolvePath(projectRoot, 'README.md'), 'utf8');
   assert.match(readme, /^# OpenCode Terminal by ZhangYahan$/m);
